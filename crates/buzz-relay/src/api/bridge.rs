@@ -21,17 +21,28 @@ use crate::state::AppState;
 
 use super::{api_error, internal_error, not_found};
 
+/// Values retained from an already-verified bridge authentication event.
+#[derive(Debug)]
+pub(crate) struct VerifiedBridgeAuth {
+    pub(crate) pubkey: nostr::PublicKey,
+    pub(crate) event_id_bytes: [u8; 32],
+    pub(crate) signed_created_at: Option<u64>,
+}
+
+type BridgeAuthResult = Result<VerifiedBridgeAuth, (StatusCode, Json<Value>)>;
+
 /// Verify bridge auth: NIP-98 (production) or X-Pubkey (dev mode).
 ///
-/// Returns the authenticated public key and an event ID for replay detection.
-/// For X-Pubkey dev mode, the event ID is a zero hash (no replay concern).
+/// Returns the authenticated public key, an event ID for replay detection, and
+/// the verified signed auth timestamp. For X-Pubkey dev mode, the event ID is
+/// a zero hash and the timestamp is absent.
 pub(crate) fn verify_bridge_auth(
     headers: &HeaderMap,
     method: &str,
     url: &str,
     body: Option<&[u8]>,
     require_auth_token: bool,
-) -> Result<(nostr::PublicKey, [u8; 32]), (StatusCode, Json<Value>)> {
+) -> BridgeAuthResult {
     verify_bridge_auth_with_options(headers, method, url, body, require_auth_token, false)
 }
 
@@ -42,7 +53,7 @@ pub(crate) fn verify_bridge_auth_with_options(
     body: Option<&[u8]>,
     require_auth_token: bool,
     require_payload: bool,
-) -> Result<(nostr::PublicKey, [u8; 32]), (StatusCode, Json<Value>)> {
+) -> BridgeAuthResult {
     // Try NIP-98 first (Authorization: Nostr <base64>)
     if let Some(auth_str) = headers
         .get("authorization")
@@ -77,7 +88,11 @@ pub(crate) fn verify_bridge_auth_with_options(
         let pubkey = buzz_auth::verify_nip98_event(&event_json, url, method, body)
             .map_err(|e| api_error(StatusCode::UNAUTHORIZED, &format!("NIP-98: {e}")))?;
 
-        return Ok((pubkey, event_id_bytes));
+        return Ok(VerifiedBridgeAuth {
+            pubkey,
+            event_id_bytes,
+            signed_created_at: Some(event.created_at.as_secs()),
+        });
     }
 
     // Dev-mode fallback: X-Pubkey header (only when require_auth_token is false)
@@ -86,7 +101,11 @@ pub(crate) fn verify_bridge_auth_with_options(
             let pubkey = nostr::PublicKey::from_hex(hex_val)
                 .map_err(|_| api_error(StatusCode::UNAUTHORIZED, "invalid X-Pubkey hex"))?;
             // Zero event ID — no replay detection needed for dev mode
-            return Ok((pubkey, [0u8; 32]));
+            return Ok(VerifiedBridgeAuth {
+                pubkey,
+                event_id_bytes: [0u8; 32],
+                signed_created_at: None,
+            });
         }
     }
 
@@ -577,7 +596,11 @@ pub async fn submit_event(
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/events");
-    let (pubkey, event_id_bytes) = verify_bridge_auth(
+    let VerifiedBridgeAuth {
+        pubkey,
+        event_id_bytes,
+        signed_created_at,
+    } = verify_bridge_auth(
         &headers,
         "POST",
         &url,
@@ -596,6 +619,7 @@ pub async fn submit_event(
         tenant.community(),
         &pubkey_bytes,
         auth_tag,
+        signed_created_at,
     )
     .await?;
 
@@ -646,7 +670,11 @@ pub async fn query_events(
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/query");
-    let (pubkey, event_id_bytes) = verify_bridge_auth(
+    let VerifiedBridgeAuth {
+        pubkey,
+        event_id_bytes,
+        signed_created_at,
+    } = verify_bridge_auth(
         &headers,
         "POST",
         &url,
@@ -662,6 +690,7 @@ pub async fn query_events(
         tenant.community(),
         &pubkey_bytes,
         auth_tag,
+        signed_created_at,
     )
     .await?;
 
@@ -1029,7 +1058,11 @@ pub async fn count_events(
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/count");
-    let (pubkey, event_id_bytes) = verify_bridge_auth(
+    let VerifiedBridgeAuth {
+        pubkey,
+        event_id_bytes,
+        signed_created_at,
+    } = verify_bridge_auth(
         &headers,
         "POST",
         &url,
@@ -1045,6 +1078,7 @@ pub async fn count_events(
         tenant.community(),
         &pubkey_bytes,
         auth_tag,
+        signed_created_at,
     )
     .await?;
 
@@ -1681,8 +1715,11 @@ async fn authorize_moderation_read(
         _ => path.to_string(),
     };
     let url = nip98_expected_url(&state.config.relay_url, &tenant, &path_with_query);
-    let (pubkey, event_id_bytes) =
-        verify_bridge_auth(headers, "GET", &url, None, state.config.require_auth_token)?;
+    let VerifiedBridgeAuth {
+        pubkey,
+        event_id_bytes,
+        ..
+    } = verify_bridge_auth(headers, "GET", &url, None, state.config.require_auth_token)?;
     check_nip98_replay(state, &tenant, event_id_bytes).await?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
@@ -2143,7 +2180,7 @@ mod tests {
         let tenant_a = fresh_tenant("host-a.example");
         let expected_url = nip98_expected_url(config_relay_url, &tenant_a, "/events");
 
-        let (pubkey, _event_id_bytes) =
+        let VerifiedBridgeAuth { pubkey, .. } =
             verify_bridge_auth(&headers, "POST", &expected_url, Some(b""), true)
                 .expect("matching-host NIP-98 event must verify");
         assert_eq!(
@@ -2192,7 +2229,7 @@ mod tests {
             Some("limit=20&status=open"),
         );
 
-        let (pubkey, _event_id_bytes) =
+        let VerifiedBridgeAuth { pubkey, .. } =
             verify_bridge_auth(&headers, "GET", &expected_url, None, true)
                 .expect("query-bearing moderation read must verify against the same query");
         assert_eq!(pubkey, keys.public_key());
@@ -2249,7 +2286,7 @@ mod tests {
             Some("limit=20"),
         );
 
-        let (pubkey, _event_id_bytes) =
+        let VerifiedBridgeAuth { pubkey, .. } =
             verify_bridge_auth(&headers, "GET", &expected_url, None, true)
                 .expect("audit query-bearing read must verify");
         assert_eq!(pubkey, keys.public_key());
@@ -2274,7 +2311,7 @@ mod tests {
         );
         assert_eq!(expected_url, "https://host-a.example/moderation/restricted");
 
-        let (pubkey, _event_id_bytes) =
+        let VerifiedBridgeAuth { pubkey, .. } =
             verify_bridge_auth(&headers, "GET", &expected_url, None, true)
                 .expect("query-less restricted read must verify against the bare path");
         assert_eq!(pubkey, keys.public_key());
