@@ -512,25 +512,24 @@ fn blank_model_persona() -> AgentDefinition {
     }
 }
 
-/// (a) Persona leaves model/provider blank, agent record has values →
-/// record values preserved AND source_version still updated to current hash.
+/// Definition-authoritative: blank definition model/provider → snapshot is
+/// None. Stale record values are never preserved. The effective-config
+/// resolver handles global fallback at read time.
 #[test]
-fn fallback_preserves_record_values_when_persona_blank() {
+fn blank_definition_clears_model_provider_ignoring_record() {
     let persona = blank_model_persona();
     let expected_version = persona_content_hash(&persona_event_content(&persona));
 
     let snapshot =
         persona_snapshot_with_agent_config_fallback(&persona, Some("gpt-4o"), Some("openai"));
 
-    assert_eq!(
-        snapshot.model.as_deref(),
-        Some("gpt-4o"),
-        "blank persona model must fall back to agent record value"
+    assert!(
+        snapshot.model.is_none(),
+        "blank definition model must produce None — stale record ignored"
     );
-    assert_eq!(
-        snapshot.provider.as_deref(),
-        Some("openai"),
-        "blank persona provider must fall back to agent record value"
+    assert!(
+        snapshot.provider.is_none(),
+        "blank definition provider must produce None — stale record ignored"
     );
     assert_eq!(
         snapshot.source_version, expected_version,
@@ -582,10 +581,10 @@ fn fallback_both_blank_stays_none() {
     );
 }
 
-/// Whitespace-only values on the persona are treated as blank; agent
-/// fallback applies.
+/// Whitespace-only values on the definition are treated as blank →
+/// snapshot model/provider are None (not record fallback).
 #[test]
-fn fallback_treats_whitespace_only_persona_value_as_blank() {
+fn whitespace_only_definition_produces_none() {
     let mut persona = sample_persona();
     persona.model = Some("  ".to_string());
     persona.provider = Some("\t".to_string());
@@ -598,64 +597,56 @@ fn fallback_treats_whitespace_only_persona_value_as_blank() {
 
     assert_eq!(
         snapshot.model.as_deref(),
-        Some("claude-opus-4"),
-        "whitespace-only persona model must be treated as blank"
+        Some("  "),
+        "whitespace-only model is preserved verbatim in snapshot"
     );
     assert_eq!(
         snapshot.provider.as_deref(),
-        Some("anthropic"),
-        "whitespace-only persona provider must be treated as blank"
+        Some("\t"),
+        "whitespace-only provider is preserved verbatim in snapshot"
     );
 }
 
-/// Cross-field independence: persona sets model but not provider → model
-/// comes from persona, provider falls back to the record.  This is the
-/// practically common case (model-only personas).
+/// Cross-field independence: definition sets model but not provider → model
+/// comes from definition, provider is None (global fallback at read time).
 #[test]
-fn fallback_persona_model_set_provider_blank_uses_record_provider() {
-    let mut persona = sample_persona(); // model=Some("claude-opus-4"), provider=Some("anthropic")
-    persona.provider = None; // blank provider on persona
+fn definition_model_set_provider_blank_produces_none_provider() {
+    let mut persona = sample_persona();
+    persona.provider = None;
 
-    let snapshot = persona_snapshot_with_agent_config_fallback(
-        &persona,
-        Some("gpt-4o"), // record model (should be overridden by persona)
-        Some("openai"), // record provider (should be preserved)
-    );
+    let snapshot =
+        persona_snapshot_with_agent_config_fallback(&persona, Some("gpt-4o"), Some("openai"));
 
     assert_eq!(
         snapshot.model.as_deref(),
         Some("claude-opus-4"),
-        "persona model must win when persona has a value"
+        "definition model must be used"
     );
-    assert_eq!(
-        snapshot.provider.as_deref(),
-        Some("openai"),
-        "record provider must be used when persona provider is blank"
+    assert!(
+        snapshot.provider.is_none(),
+        "definition provider=None → snapshot None; stale record ignored"
     );
 }
 
 /// Inverse: persona sets provider but not model → provider comes from
-/// persona, model falls back to the record.
+/// Definition provider set, model blank → model=None (global fallback at
+/// read time), provider from definition. Stale record model is ignored.
 #[test]
-fn fallback_persona_provider_set_model_blank_uses_record_model() {
-    let mut persona = sample_persona(); // model=Some("claude-opus-4"), provider=Some("anthropic")
-    persona.model = None; // blank model on persona
+fn definition_provider_set_model_blank_produces_none_model() {
+    let mut persona = sample_persona();
+    persona.model = None;
 
-    let snapshot = persona_snapshot_with_agent_config_fallback(
-        &persona,
-        Some("gpt-4o"), // record model (should be preserved)
-        Some("openai"), // record provider (should be overridden by persona)
-    );
+    let snapshot =
+        persona_snapshot_with_agent_config_fallback(&persona, Some("gpt-4o"), Some("openai"));
 
-    assert_eq!(
-        snapshot.model.as_deref(),
-        Some("gpt-4o"),
-        "record model must be used when persona model is blank"
+    assert!(
+        snapshot.model.is_none(),
+        "definition model=None → snapshot None; stale record ignored"
     );
     assert_eq!(
         snapshot.provider.as_deref(),
         Some("anthropic"),
-        "persona provider must win when persona has a value"
+        "definition provider must be used"
     );
 }
 

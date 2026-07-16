@@ -377,41 +377,20 @@ pub fn persona_snapshot(persona: &AgentDefinition) -> PersonaSnapshot {
 /// Build the pinned snapshot for an **existing** agent record being re-snapshotted
 /// from its linked persona (on spawn or app-launch restore).
 ///
-/// Precedence rule: when the persona sets `model` or `provider` (non-`None`, non-empty),
-/// the persona wins — this is the expected inheritance. When the persona leaves
-/// these fields blank (`None` or empty string), the agent record's own values are
-/// preserved instead. This prevents a persona with no configured model/provider from
-/// clobbering a value the user already set on the agent, which would trap the agent
-/// in a permanent "needs configuration" loop that users cannot escape.
+/// Definition-authoritative: the persona's model/provider are taken verbatim.
+/// When the persona leaves a field blank (`None` or empty string), the
+/// snapshot field is `None` — the stale materialized record value is never
+/// consulted. The effective-config resolver will fall through to the global
+/// default at read time; the record no longer participates.
 ///
 /// `source_version` is always updated to the current persona content hash so the
 /// drift badge clears correctly even when model/provider are not touched.
-///
-/// Env vars are not part of the snapshot: `record.env_vars` (agent overrides)
-/// is left untouched and the live persona env is merged underneath at read time.
-///
-/// The two fields (`model`, `provider`) are independent: a persona that sets only
-/// `model` wins on `model` while the agent's `provider` is preserved, and vice versa.
 pub fn persona_snapshot_with_agent_config_fallback(
     persona: &AgentDefinition,
-    current_agent_model: Option<&str>,
-    current_agent_provider: Option<&str>,
+    _current_agent_model: Option<&str>,
+    _current_agent_provider: Option<&str>,
 ) -> PersonaSnapshot {
-    // Delegate system_prompt and source_version to persona_snapshot so future
-    // PersonaSnapshot field additions stay automatically consistent.
-    let base = persona_snapshot(persona);
-
-    // Apply the shared precedence rule: persona wins when non-blank, else
-    // the agent record's value is preserved so a configured agent stays configured.
-    let model = persona_field_with_record_fallback(base.model.as_deref(), current_agent_model);
-    let provider =
-        persona_field_with_record_fallback(base.provider.as_deref(), current_agent_provider);
-
-    PersonaSnapshot {
-        model,
-        provider,
-        ..base
-    }
+    persona_snapshot(persona)
 }
 
 /// Re-pin `record` to `persona`: build the snapshot (via

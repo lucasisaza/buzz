@@ -286,7 +286,7 @@ function AgentPersonaCard({
   onStartPersona: (persona: AgentPersona) => void;
 }) {
   const title = persona.displayName;
-  const explicitModel = agent?.model ?? persona.model;
+  const explicitModel = agent?.model;
   const modelLabel = explicitModel?.trim()
     ? formatAgentModelLabel(explicitModel)
     : formatDefaultModelLabel(defaultModel);
