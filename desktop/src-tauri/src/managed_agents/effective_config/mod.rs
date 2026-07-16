@@ -1,7 +1,10 @@
+use serde::Serialize;
+
 use super::global_config::GlobalAgentConfig;
 use super::types::{AgentDefinition, ManagedAgentRecord};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConfigSource {
     Definition,
     Global,

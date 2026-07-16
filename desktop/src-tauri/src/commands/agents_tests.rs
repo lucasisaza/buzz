@@ -150,6 +150,30 @@ fn deploy_resolver_falls_back_to_global_when_definition_and_record_have_none() {
     assert_eq!(provider.as_deref(), Some("global-prov"));
 }
 
+/// Orphan: linked record with missing definition → deploy resolver returns
+/// (None, None), spawn is blocked by the orphan guard.
+#[test]
+fn deploy_resolver_returns_none_for_orphaned_instance() {
+    let record = bare_agent_record(Some("missing-def"), Some("stale-model"), Some("stale-prov"));
+    let personas: Vec<AgentDefinition> = vec![];
+    let global = crate::managed_agents::GlobalAgentConfig {
+        model: Some("global-model".to_string()),
+        provider: Some("global-prov".to_string()),
+        ..Default::default()
+    };
+
+    let (model, provider) = resolve_deploy_model_provider(&record, &personas, &global);
+
+    assert!(
+        model.is_none(),
+        "orphaned instance must not resolve to any model"
+    );
+    assert!(
+        provider.is_none(),
+        "orphaned instance must not resolve to any provider"
+    );
+}
+
 #[test]
 fn normalize_relay_mesh_rejects_empty_model_ref() {
     let config = RelayMeshConfig {

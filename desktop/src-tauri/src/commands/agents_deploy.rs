@@ -4,9 +4,11 @@
 
 use tauri::AppHandle;
 
+#[cfg(test)]
+use crate::managed_agents::AgentDefinition;
 use crate::{
     app_state::AppState,
-    managed_agents::{load_personas, AgentDefinition, ManagedAgentRecord},
+    managed_agents::{load_personas, ManagedAgentRecord},
     relay::relay_ws_url_with_override,
 };
 
@@ -22,6 +24,7 @@ use crate::{
 /// disagree on what model/provider an agent runs with.
 ///
 /// Exported `pub(crate)` for unit testing.
+#[cfg(test)]
 pub(crate) fn resolve_deploy_model_provider(
     record: &ManagedAgentRecord,
     personas: &[AgentDefinition],
@@ -75,24 +78,25 @@ pub(super) fn build_deploy_payload(
     let merged_env =
         crate::managed_agents::merged_user_env(&global_persona_merged, &record.env_vars);
 
-    // Resolve effective config through the single resolver. For linked
-    // instances: definition → global (stale record bytes ignored). For
-    // definition-less: instance → global.
     let personas = load_personas(app).unwrap_or_default();
-    let (effective_model, effective_provider) =
-        resolve_deploy_model_provider(record, &personas, &global_config);
-    let effective_prompt = match crate::managed_agents::effective_config::resolve_effective_config(
+    let effective_cfg = crate::managed_agents::effective_config::resolve_effective_config(
         record,
         &personas,
         &global_config,
-    ) {
-        crate::managed_agents::effective_config::EffectiveConfigResult::Resolved(cfg) => {
-            cfg.system_prompt.value
-        }
+    );
+    let cfg = match effective_cfg {
+        crate::managed_agents::effective_config::EffectiveConfigResult::Resolved(c) => c,
         crate::managed_agents::effective_config::EffectiveConfigResult::OrphanedInstance {
             ..
-        } => None,
+        } => {
+            return Err("This agent's configuration is missing — it may still be \
+                 syncing or was deleted on another device."
+                .to_string());
+        }
     };
+    let effective_model = cfg.model.value;
+    let effective_provider = cfg.provider.value;
+    let effective_prompt = cfg.system_prompt.value;
 
     Ok(deploy_payload_json(
         record,

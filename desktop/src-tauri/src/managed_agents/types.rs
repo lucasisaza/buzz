@@ -475,6 +475,8 @@ pub struct ManagedAgentSummary {
     pub system_prompt: Option<String>,
     pub avatar_url: Option<String>,
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_source: Option<super::effective_config::ConfigSource>,
     /// LLM inference provider, from the agent's pinned record snapshot.
     pub provider: Option<String>,
     /// `true` when the linked persona has been edited since this agent was

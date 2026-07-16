@@ -286,10 +286,12 @@ function AgentPersonaCard({
   onStartPersona: (persona: AgentPersona) => void;
 }) {
   const title = persona.displayName;
-  const explicitModel = agent?.model;
-  const modelLabel = explicitModel?.trim()
-    ? formatAgentModelLabel(explicitModel)
-    : formatDefaultModelLabel(defaultModel);
+  const isInherited = !agent?.modelSource || agent.modelSource === "global";
+  const modelLabel = isInherited
+    ? formatDefaultModelLabel(defaultModel)
+    : agent?.model?.trim()
+      ? formatAgentModelLabel(agent.model)
+      : formatDefaultModelLabel(defaultModel);
   const isActive = agent ? isManagedAgentActive(agent) : false;
   const profileQuery = useUserProfileQuery(agent?.pubkey);
   const avatarUrl = agent
@@ -405,11 +407,15 @@ function StandaloneAgentCard({
       avatarUrl={profileQuery.data?.avatarUrl}
       dataTestId={`managed-agent-${agent.pubkey}`}
       label={title}
-      modelLabel={
-        agent.model?.trim()
-          ? formatAgentModelLabel(agent.model)
-          : formatDefaultModelLabel(defaultModel)
-      }
+      modelLabel={(() => {
+        const isInherited =
+          !agent.modelSource || agent.modelSource === "global";
+        return isInherited
+          ? formatDefaultModelLabel(defaultModel)
+          : agent.model?.trim()
+            ? formatAgentModelLabel(agent.model)
+            : formatDefaultModelLabel(defaultModel);
+      })()}
       onClick={() => {
         onOpenAgentProfile(
           agent.pubkey,

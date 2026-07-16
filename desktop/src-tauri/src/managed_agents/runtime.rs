@@ -1320,13 +1320,26 @@ pub fn build_managed_agent_summary(
         personas,
         &global_for_summary,
     );
-    let (effective_model, effective_provider, effective_prompt) = match effective_cfg {
+    let (effective_model, effective_provider, effective_prompt, model_source) = match effective_cfg
+    {
         crate::managed_agents::effective_config::EffectiveConfigResult::Resolved(cfg) => {
-            (cfg.model.value, cfg.provider.value, cfg.system_prompt.value)
+            let source = cfg.model.source.clone();
+            (
+                cfg.model.value,
+                cfg.provider.value,
+                cfg.system_prompt.value,
+                Some(source),
+            )
         }
         crate::managed_agents::effective_config::EffectiveConfigResult::OrphanedInstance {
-            ..
-        } => (None, None, record.system_prompt.clone()),
+            record_pubkey,
+            missing_persona_id,
+        } => {
+            eprintln!(
+                "orphaned agent instance: pubkey={record_pubkey}, missing_persona_id={missing_persona_id}"
+            );
+            (None, None, None, None)
+        }
     };
 
     // Restart badge: the running process stamped its effective spawn config
@@ -1386,6 +1399,7 @@ pub fn build_managed_agent_summary(
         system_prompt: effective_prompt,
         avatar_url: record.avatar_url.clone(),
         model: effective_model,
+        model_source,
         provider: effective_provider,
         persona_out_of_date,
         persona_orphaned,
