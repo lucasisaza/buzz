@@ -467,6 +467,11 @@ pub struct CliArgs {
     /// Publish encrypted ACP observer frames over the relay.
     #[arg(long, env = "BUZZ_ACP_RELAY_OBSERVER", default_value_t = false)]
     pub relay_observer: bool,
+
+    /// Isolate managed-agent ACP sessions by human conversation root.
+    /// Disabled by default; Desktop enables it through its in-app experiment.
+    #[arg(long, env = "BUZZ_ACP_TOP_LEVEL_SESSIONS", default_value_t = false)]
+    pub top_level_sessions: bool,
 }
 
 /// Merged NIP-01 subscription filter for a single channel.
@@ -537,6 +542,8 @@ pub struct Config {
     pub has_generated_codex_config: bool,
     /// Whether to publish encrypted observer frames through the relay.
     pub relay_observer: bool,
+    /// Whether channel turns use conversation-root-scoped ACP sessions.
+    pub top_level_sessions: bool,
     /// Agent owner pubkey (hex). Used for `--respond-to=owner-only` gate.
     /// Replaces the old REST-based owner lookup.
     pub agent_owner: Option<String>,
@@ -996,6 +1003,7 @@ impl Config {
             persona_env_vars,
             has_generated_codex_config,
             relay_observer: args.relay_observer,
+            top_level_sessions: args.top_level_sessions,
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
@@ -1369,6 +1377,7 @@ mod tests {
             has_generated_codex_config: false,
             relay_observer: false,
             agent_owner: None,
+            top_level_sessions: false,
             no_base_prompt: false,
             base_prompt_content: None,
         }

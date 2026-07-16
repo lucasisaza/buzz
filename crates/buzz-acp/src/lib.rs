@@ -814,6 +814,7 @@ fn handle_switch_model_control(
             channel_id,
             ControlSignal::SwitchModel(model_id.to_string()),
         ) {
+            pool.switch_other_idle_channel_roots(channel_id, model_id);
             "sent"
         } else {
             "turn_ending"
@@ -1430,7 +1431,7 @@ async fn tokio_main() -> Result<()> {
         base_prompt: if config.no_base_prompt {
             None
         } else if let Some(content) = base_prompt_content {
-            Some(Box::leak(content.into_boxed_str()))
+            Some(Box::leak(content.into_boxed_str()) as &str)
         } else {
             Some(include_str!("base_prompt.md"))
         },
@@ -1449,6 +1450,7 @@ async fn tokio_main() -> Result<()> {
             .as_deref()
             .and_then(|hex| nostr::PublicKey::from_hex(hex).ok()),
         memory_enabled: config.memory_enabled,
+        top_level_sessions: config.top_level_sessions,
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
     });
 
@@ -1606,6 +1608,7 @@ async fn tokio_main() -> Result<()> {
                 if !slot.can_refill() {
                     continue;
                 }
+                pool.clear_slot_session_owners(idx);
                 slot.respawn_in_flight = true;
                 tracing::info!(agent = idx, "slot refill: spawning background respawn");
                 let cmd = config.agent_command.clone();
@@ -1998,6 +2001,12 @@ async fn tokio_main() -> Result<()> {
                                 event: buzz_event.event,
                                 received_at: std::time::Instant::now(),
                                 prompt_tag,
+                                conversation_root: if config.top_level_sessions {
+                                    let tags = queue::parse_thread_tags(&event_for_steer);
+                                    Some(tags.root_event_id.unwrap_or_else(|| event_id_hex.clone()))
+                                } else {
+                                    None
+                                },
                             });
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
@@ -2146,8 +2155,8 @@ async fn tokio_main() -> Result<()> {
         match pool_event {
             Some(PoolEvent::Result(result)) => {
                 // Stop typing indicator for the completed channel.
-                if let PromptSource::Channel(ch) = &result.source {
-                    typing_channels.remove(ch);
+                if let PromptSource::Channel(key) = &result.source {
+                    typing_channels.remove(&key.channel_id);
                 }
                 if handle_prompt_result(
                     &mut pool,
@@ -2629,8 +2638,9 @@ fn dispatch_pending(
             .last()
             .map(|event| queue::parse_thread_tags(&event.event))
             .unwrap_or_default();
-        let affinity_hit = pool.has_session_for(channel_id);
-        let mut agent = match pool.try_claim(Some(channel_id)) {
+        let session_key = pool::conversation_session_key(&batch, ctx.top_level_sessions);
+        let affinity_hit = pool.has_session_for(&session_key);
+        let mut agent = match pool.try_claim(Some(&session_key)) {
             Some(a) => a,
             None => {
                 let pending = queue.pending_channels();
@@ -2819,7 +2829,7 @@ fn handle_prompt_result(
     }
 
     match &result.source {
-        PromptSource::Channel(ch) => queue.mark_complete(*ch),
+        PromptSource::Channel(key) => queue.mark_complete(key.channel_id),
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
     }
 
@@ -2855,7 +2865,7 @@ fn handle_prompt_result(
     let harness_pid = std::process::id();
 
     let channel_id = match &result.source {
-        PromptSource::Channel(ch) => Some(*ch),
+        PromptSource::Channel(key) => Some(key.channel_id),
         PromptSource::Heartbeat => None,
     };
     let emit_turn_error = |error_msg: &str, error_code: Option<i64>| {
@@ -2906,6 +2916,7 @@ fn handle_prompt_result(
             emit_turn_error(&death_message, None);
 
             let index = result.agent.index;
+            pool.clear_slot_session_owners(index);
             let slot_history = &mut crash_history[index];
             if !spawn_respawn_task(
                 result.agent,
@@ -2946,6 +2957,7 @@ fn handle_prompt_result(
             emit_turn_error(&death_message, None);
 
             let index = result.agent.index;
+            pool.clear_slot_session_owners(index);
             let slot_history = &mut crash_history[index];
             if !spawn_respawn_task(
                 result.agent,
@@ -3011,6 +3023,7 @@ fn handle_prompt_result(
                 emit_turn_error(&e.to_string(), error_code);
 
                 let index = result.agent.index;
+                pool.clear_slot_session_owners(index);
                 let slot_history = &mut crash_history[index];
                 if !spawn_respawn_task(
                     result.agent,
@@ -3062,6 +3075,7 @@ fn recover_panicked_agent(
         return;
     };
     let i = meta.agent_index;
+    pool.clear_slot_session_owners(i);
 
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
     if let Some(batch) = meta.recoverable_batch {
@@ -4113,6 +4127,7 @@ mod build_mcp_servers_tests {
             has_generated_codex_config: false,
             relay_observer: false,
             agent_owner: None,
+            top_level_sessions: false,
             no_base_prompt: false,
             base_prompt_content: None,
         }
@@ -4278,6 +4293,7 @@ mod error_outcome_emission_tests {
             has_generated_codex_config: false,
             relay_observer: false,
             agent_owner: None,
+            top_level_sessions: false,
             no_base_prompt: false,
             base_prompt_content: None,
         }
@@ -4300,6 +4316,171 @@ mod error_outcome_emission_tests {
             // non-systemPrompt path, the simplest valid value.
             protocol_version: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn root_affinity_waits_for_busy_owner_instead_of_using_idle_slot() {
+        let first = dummy_agent(0).await;
+        let second = dummy_agent(1).await;
+        let mut pool = AgentPool::from_slots(vec![Some(first), Some(second)]);
+        let key = pool::ConversationSessionKey {
+            channel_id: Uuid::new_v4(),
+            root_event_id: Some("root-a".into()),
+        };
+
+        let mut owner = pool
+            .try_claim(Some(&key))
+            .expect("root should reserve slot 0");
+        assert_eq!(owner.index, 0);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(key.channel_id),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+            },
+        );
+        assert!(pool.any_idle(), "slot 1 remains idle");
+        assert!(
+            pool.try_claim(Some(&key)).is_none(),
+            "reply must wait for the reserved root owner"
+        );
+        pool.task_map_mut().remove(&task_id);
+        owner.state.insert_session(key.clone(), "session-a".into());
+        pool.return_agent(owner);
+        assert_eq!(pool.try_claim(Some(&key)).unwrap().index, 0);
+    }
+
+    async fn pool_with_retained_root() -> (AgentPool, pool::ConversationSessionKey) {
+        let first = dummy_agent(0).await;
+        let second = dummy_agent(1).await;
+        let mut pool = AgentPool::from_slots(vec![Some(first), Some(second)]);
+        let key = pool::ConversationSessionKey {
+            channel_id: Uuid::new_v4(),
+            root_event_id: Some("root-a".into()),
+        };
+        let mut owner = pool.try_claim(Some(&key)).unwrap();
+        owner.state.insert_session(key.clone(), "session-a".into());
+        pool.return_agent(owner);
+        (pool, key)
+    }
+
+    #[tokio::test]
+    async fn root_owner_is_cleared_after_lru_eviction() {
+        let (mut pool, key) = pool_with_retained_root().await;
+        let mut owner = pool.try_claim(Some(&key)).unwrap();
+        for index in 0..=pool::SessionState::MAX_CHANNEL_SESSIONS {
+            owner.state.insert_session(
+                pool::ConversationSessionKey {
+                    channel_id: key.channel_id,
+                    root_event_id: Some(format!("new-root-{index}")),
+                },
+                format!("session-{index}"),
+            );
+        }
+        assert!(!owner.state.contains_session(&key));
+        pool.return_agent(owner);
+        pool.agents_mut()[0] = None;
+        assert_eq!(pool.try_claim(Some(&key)).unwrap().index, 1);
+    }
+
+    #[tokio::test]
+    async fn root_owner_is_cleared_by_channel_invalidation() {
+        let (mut pool, key) = pool_with_retained_root().await;
+        assert_eq!(pool.invalidate_channel_sessions(key.channel_id), 1);
+        pool.agents_mut()[0] = None;
+        assert_eq!(pool.try_claim(Some(&key)).unwrap().index, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_dead_root_owner_falls_back_to_live_slot() {
+        let (mut pool, key) = pool_with_retained_root().await;
+        pool.agents_mut()[0] = None;
+        assert_eq!(pool.try_claim(Some(&key)).unwrap().index, 1);
+    }
+
+    #[tokio::test]
+    async fn dead_slot_cleanup_removes_all_root_reservations() {
+        let first = dummy_agent(0).await;
+        let second = dummy_agent(1).await;
+        let mut pool = AgentPool::from_slots(vec![Some(first), Some(second)]);
+        let channel_id = Uuid::new_v4();
+        let keys: Vec<_> = ["root-a", "root-b"]
+            .into_iter()
+            .map(|root| pool::ConversationSessionKey {
+                channel_id,
+                root_event_id: Some(root.into()),
+            })
+            .collect();
+        for key in &keys {
+            let mut owner = pool.try_claim(Some(key)).unwrap();
+            owner
+                .state
+                .insert_session(key.clone(), format!("session-{key:?}"));
+            pool.return_agent(owner);
+        }
+        pool.agents_mut()[0] = None;
+        assert_eq!(pool.clear_slot_session_owners(0), 2);
+        assert_eq!(pool.try_claim(Some(&keys[0])).unwrap().index, 1);
+    }
+
+    #[tokio::test]
+    async fn idle_model_switch_invalidates_all_roots_across_slots() {
+        let channel_id = Uuid::new_v4();
+        let key_a = pool::ConversationSessionKey {
+            channel_id,
+            root_event_id: Some("a".into()),
+        };
+        let key_b = pool::ConversationSessionKey {
+            channel_id,
+            root_event_id: Some("b".into()),
+        };
+        let mut first = dummy_agent(0).await;
+        first
+            .state
+            .insert_session(key_a.clone(), "session-a".into());
+        let mut second = dummy_agent(1).await;
+        second
+            .state
+            .insert_session(key_b.clone(), "session-b".into());
+        let mut pool = AgentPool::from_slots(vec![Some(first), Some(second)]);
+        assert_eq!(
+            pool.switch_idle_agent_model(channel_id, "new-model"),
+            IdleSwitchResult::Switched
+        );
+        for agent in pool.agents_mut().iter().flatten() {
+            assert!(!agent.state.has_channel_state(&channel_id));
+            assert_eq!(agent.desired_model.as_deref(), Some("new-model"));
+        }
+    }
+
+    #[tokio::test]
+    async fn busy_model_switch_invalidates_other_idle_roots() {
+        let channel_id = Uuid::new_v4();
+        let busy_key = pool::ConversationSessionKey {
+            channel_id,
+            root_event_id: Some("busy".into()),
+        };
+        let idle_key = pool::ConversationSessionKey {
+            channel_id,
+            root_event_id: Some("idle".into()),
+        };
+        let mut first = dummy_agent(0).await;
+        first
+            .state
+            .insert_session(busy_key.clone(), "session-busy".into());
+        let mut second = dummy_agent(1).await;
+        second.state.insert_session(idle_key, "session-idle".into());
+        let mut pool = AgentPool::from_slots(vec![Some(first), Some(second)]);
+        let busy = pool.try_claim(Some(&busy_key)).unwrap();
+        pool.switch_other_idle_channel_roots(channel_id, "new-model");
+        let idle = pool.agents_mut()[1].as_ref().unwrap();
+        assert!(!idle.state.has_channel_state(&channel_id));
+        assert_eq!(idle.desired_model.as_deref(), Some("new-model"));
+        pool.return_agent(busy);
     }
 
     /// Drive one error outcome through `handle_prompt_result` and return how
@@ -4339,7 +4520,7 @@ mod error_outcome_emission_tests {
 
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(Uuid::new_v4()),
+            source: PromptSource::Channel(pool::ConversationSessionKey::channel(Uuid::new_v4())),
             outcome,
             batch: None,
         };
@@ -4428,7 +4609,9 @@ mod error_outcome_emission_tests {
             let observer = ObserverHandle::in_process();
             let result = PromptResult {
                 agent,
-                source: PromptSource::Channel(Uuid::new_v4()),
+                source: PromptSource::Channel(
+                    pool::ConversationSessionKey::channel(Uuid::new_v4()),
+                ),
                 outcome,
                 batch: None,
             };
@@ -4470,6 +4653,7 @@ mod error_outcome_emission_tests {
                 .sign_with_keys(&keys)
                 .unwrap();
             FlushBatch {
+                conversation_root: None,
                 channel_id: Uuid::new_v4(),
                 events: vec![BatchEvent {
                     event,
@@ -4510,7 +4694,7 @@ mod error_outcome_emission_tests {
             let mut respawn_tasks = tokio::task::JoinSet::new();
             let result = PromptResult {
                 agent,
-                source: PromptSource::Channel(channel_id),
+                source: PromptSource::Channel(pool::ConversationSessionKey::channel(channel_id)),
                 outcome,
                 batch: Some(batch),
             };
@@ -4584,6 +4768,7 @@ mod error_outcome_emission_tests {
         );
         let channel_id = Uuid::new_v4();
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id,
             events: vec![BatchEvent {
                 event: original_event.clone(),
@@ -4613,6 +4798,7 @@ mod error_outcome_emission_tests {
         // out on drain — so it is already queued by the time
         // handle_prompt_result runs.
         queue.push(QueuedEvent {
+            conversation_root: None,
             channel_id,
             event: new_event.clone(),
             received_at: std::time::Instant::now(),
@@ -4632,7 +4818,7 @@ mod error_outcome_emission_tests {
         let grace = std::time::Duration::from_secs(5);
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(channel_id),
+            source: PromptSource::Channel(pool::ConversationSessionKey::channel(channel_id)),
             outcome: PromptOutcome::CancelDrainTimeout(grace),
             batch: Some(batch),
         };
@@ -4759,7 +4945,7 @@ mod error_outcome_emission_tests {
         let grace = std::time::Duration::from_secs(5);
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(Uuid::new_v4()),
+            source: PromptSource::Channel(pool::ConversationSessionKey::channel(Uuid::new_v4())),
             outcome: PromptOutcome::CancelDrainTimeout(grace),
             // Explicit Stop already dropped the batch upstream in
             // `classify_control_cancel_failure` — `handle_prompt_result`

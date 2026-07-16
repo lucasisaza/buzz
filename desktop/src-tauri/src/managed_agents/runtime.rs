@@ -1710,7 +1710,16 @@ pub fn spawn_agent_child(
         .unwrap_or(super::types::DEFAULT_AGENT_MAX_TURN_DURATION_SECONDS);
     command.env("BUZZ_ACP_MAX_TURN_DURATION", max_dur.to_string());
     command.env("BUZZ_ACP_AGENTS", record.parallelism.to_string());
+    // Legacy default. User env may override this while the experiment is off;
+    // enabled experiment state is authoritatively finalized at the spawn boundary.
     command.env("BUZZ_ACP_MULTIPLE_EVENT_HANDLING", "steer");
+    let top_level_sessions = {
+        use std::sync::atomic::Ordering;
+        use tauri::Manager;
+        app.state::<crate::app_state::AppState>()
+            .acp_top_level_sessions_experiment
+            .load(Ordering::Acquire)
+    };
     command.env("BUZZ_ACP_DEDUP", "queue");
     if let Some(meta) = runtime_meta {
         for (key, value) in meta.default_env {
@@ -1863,6 +1872,11 @@ pub fn spawn_agent_child(
     // goose → MCP servers) because neither buzz-acp nor goose calls
     // env_clear().
     command.env("BUZZ_MANAGED_AGENT", current_instance_id(app));
+
+    // Finalize after every default and user env write. Enabled experiment state
+    // must be authoritative; disabled state only removes the new variable and
+    // preserves the legacy handling override chosen above or supplied by users.
+    finalize_acp_top_level_sessions_env(&mut command, top_level_sessions);
 
     // Spawn the harness in its own process group so we can kill the entire
     // tree (harness + MCP servers + agent subprocesses) on shutdown.
@@ -2116,6 +2130,19 @@ pub(crate) fn resolve_effective_prompt_model_provider(
             fallback(p.provider.as_deref(), record_provider.as_deref()), // fallback: record.provider
         ),
         None => (record_prompt, record_model, record_provider),
+    }
+}
+
+fn finalize_acp_top_level_sessions_env(command: &mut std::process::Command, enabled: bool) {
+    if enabled {
+        command.env("BUZZ_ACP_TOP_LEVEL_SESSIONS", "true");
+        // Conversation roots remain channel-serialized but must never steer
+        // into another root's in-flight ACP session.
+        command.env("BUZZ_ACP_MULTIPLE_EVENT_HANDLING", "queue");
+    } else {
+        // The experiment's variable is never user-controlled while disabled.
+        // Do not touch MULTIPLE_EVENT_HANDLING: legacy user overrides remain valid.
+        command.env_remove("BUZZ_ACP_TOP_LEVEL_SESSIONS");
     }
 }
 

@@ -491,6 +491,16 @@ pub fn run() {
                 migration::run_boot_migrations(&app_handle);
             }
 
+            // Hydrate Rust-owned experiments before any launch-time managed-agent
+            // restore can spawn a process. A corrupt store fails closed and leaves
+            // the disabled default in place.
+            let state = app_handle.state::<AppState>();
+            if let Err(error) =
+                commands::experiments::hydrate_desktop_experiments(&app_handle, &state)
+            {
+                eprintln!("buzz-desktop: failed to hydrate desktop experiments: {error}");
+            }
+
             // Resolve persisted identity key (env var → file → generate+save).
             // This is fatal — the app should not start with an ephemeral identity
             // that will be lost on restart, as that silently breaks channel
@@ -845,6 +855,8 @@ pub fn run() {
             list_managed_agents,
             create_managed_agent,
             start_managed_agent,
+            get_acp_top_level_sessions_experiment,
+            set_acp_top_level_sessions_experiment,
             stop_managed_agent,
             set_managed_agent_start_on_app_launch,
             set_managed_agent_auto_restart,

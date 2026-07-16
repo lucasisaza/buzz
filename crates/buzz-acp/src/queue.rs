@@ -49,6 +49,8 @@ pub struct QueuedEvent {
     pub received_at: Instant,
     /// Tag identifying which rule (or mode) matched this event.
     pub prompt_tag: String,
+    /// Conversation root used only by the top-level-session experiment.
+    pub conversation_root: Option<String>,
 }
 
 /// A single event inside a [`FlushBatch`].
@@ -77,6 +79,7 @@ pub enum CancelReason {
 pub struct FlushBatch {
     pub channel_id: Uuid,
     pub events: Vec<BatchEvent>,
+    pub conversation_root: Option<String>,
     /// Events from a cancelled batch that triggered this re-prompt.
     /// Empty for normal (non-cancel) batches. When non-empty, `format_prompt()`
     /// produces a merged prompt with annotated sections, framed per
@@ -87,6 +90,13 @@ pub struct FlushBatch {
     /// [`Steer`](CancelReason::Steer) framing if a merge somehow lacks a reason
     /// (see [`MergeFraming::for_reason`]).
     pub cancel_reason: Option<CancelReason>,
+}
+
+#[derive(Debug, Clone)]
+struct CancelledBatch {
+    conversation_root: Option<String>,
+    events: Vec<BatchEvent>,
+    reason: CancelReason,
 }
 
 /// Per-channel event queue with per-channel in-flight enforcement.
@@ -145,14 +155,9 @@ pub struct EventQueue {
     /// Per-channel retry attempt counter for exponential backoff / dead-lettering.
     retry_counts: HashMap<Uuid, u32>,
     dedup_mode: DedupMode,
-    /// Events from cancelled batches, keyed by channel. Merged into the next
-    /// `FlushBatch` for that channel as `cancelled_events` so `format_prompt()`
-    /// can produce annotated "[Previous request — interrupted]" sections.
-    cancelled_batches: HashMap<Uuid, Vec<BatchEvent>>,
-    /// Why each channel's cancelled batch was cancelled (steer vs interrupt).
-    /// Set by `requeue_as_cancelled`, consumed by `flush_next` to set
-    /// `FlushBatch::cancel_reason`. Keyed by channel, cleared on flush.
-    cancel_reasons: HashMap<Uuid, CancelReason>,
+    /// Cancelled batches awaiting redispatch, preserving conversation identity.
+    /// Multiple roots may wait behind the same channel, but are never merged.
+    cancelled_batches: HashMap<Uuid, VecDeque<CancelledBatch>>,
     /// Events withheld from `queues` while a goose-native steer is in flight
     /// for that event. Invisible to `flush_next` / `has_flushable_work` /
     /// `drain` (the events have been moved out of `queues`), so the queue's
@@ -186,7 +191,6 @@ impl EventQueue {
             retry_counts: HashMap::new(),
             dedup_mode,
             cancelled_batches: HashMap::new(),
-            cancel_reasons: HashMap::new(),
             withheld_native_steer: HashMap::new(),
             in_flight_deadline: Duration::from_secs(DEFAULT_IN_FLIGHT_DEADLINE_SECS),
         }
@@ -291,19 +295,31 @@ impl EventQueue {
                     .copied();
                 match cancelled_id {
                     Some(id) => {
-                        // Move cancelled events into the regular events slot.
-                        // No new events to merge — re-dispatch the original batch.
-                        let cancelled = self.cancelled_batches.remove(&id).unwrap_or_default();
-                        let cancel_reason = self.cancel_reasons.remove(&id);
+                        // No new events to merge — re-dispatch the oldest cancelled
+                        // batch unchanged under its original conversation root.
+                        let cancelled = self
+                            .cancelled_batches
+                            .get_mut(&id)
+                            .and_then(VecDeque::pop_front)
+                            .expect("cancelled channel must have a batch");
+                        if self
+                            .cancelled_batches
+                            .get(&id)
+                            .is_some_and(VecDeque::is_empty)
+                        {
+                            self.cancelled_batches.remove(&id);
+                        }
                         self.in_flight_channels.insert(id);
                         self.in_flight_deadlines
                             .insert(id, now + self.in_flight_deadline);
-                        self.in_flight_batch_sizes.insert(id, cancelled.len());
+                        self.in_flight_batch_sizes
+                            .insert(id, cancelled.events.len());
                         return Some(FlushBatch {
                             channel_id: id,
-                            events: cancelled,
+                            conversation_root: cancelled.conversation_root,
+                            events: cancelled.events,
                             cancelled_events: vec![],
-                            cancel_reason,
+                            cancel_reason: Some(cancelled.reason),
                         });
                     }
                     None => return None,
@@ -311,9 +327,55 @@ impl EventQueue {
             }
         };
 
+        let queued_root = self
+            .queues
+            .get(&channel_id)
+            .and_then(|queue| queue.front())
+            .and_then(|event| event.conversation_root.clone());
+        let cancelled_root = self
+            .cancelled_batches
+            .get(&channel_id)
+            .and_then(|batches| batches.front())
+            .and_then(|batch| batch.conversation_root.clone());
+        if self.cancelled_batches.contains_key(&channel_id) && cancelled_root != queued_root {
+            let cancelled = self
+                .cancelled_batches
+                .get_mut(&channel_id)
+                .and_then(VecDeque::pop_front)
+                .expect("cancelled channel must have a batch");
+            if self
+                .cancelled_batches
+                .get(&channel_id)
+                .is_some_and(VecDeque::is_empty)
+            {
+                self.cancelled_batches.remove(&channel_id);
+            }
+            self.in_flight_channels.insert(channel_id);
+            self.in_flight_deadlines
+                .insert(channel_id, now + self.in_flight_deadline);
+            self.in_flight_batch_sizes
+                .insert(channel_id, cancelled.events.len());
+            return Some(FlushBatch {
+                channel_id,
+                conversation_root: cancelled.conversation_root,
+                events: cancelled.events,
+                cancelled_events: vec![],
+                cancel_reason: Some(cancelled.reason),
+            });
+        }
+
         // Drain up to MAX_BATCH_EVENTS; leave any remainder in the queue.
         let queue = self.queues.entry(channel_id).or_default();
-        let drain_count = MAX_BATCH_EVENTS.min(queue.len());
+        // Never merge independent experiment roots into one ACP turn. Drain only
+        // the contiguous head conversation while retaining channel serialization.
+        let head_root = queue
+            .front()
+            .and_then(|event| event.conversation_root.clone());
+        let same_root_count = queue
+            .iter()
+            .take_while(|event| event.conversation_root == head_root)
+            .count();
+        let drain_count = MAX_BATCH_EVENTS.min(same_root_count);
         let mut events: Vec<BatchEvent> = queue
             .drain(..drain_count)
             .map(|qe| BatchEvent {
@@ -338,20 +400,26 @@ impl EventQueue {
             .insert(channel_id, now + self.in_flight_deadline);
         self.in_flight_batch_sizes.insert(channel_id, events.len());
 
-        // Merge any cancelled events stored by requeue_as_cancelled().
-        let cancelled_events = self
+        // Merge only a cancelled batch for the same conversation root.
+        let cancelled = self
             .cancelled_batches
-            .remove(&channel_id)
-            .unwrap_or_default();
-        let cancel_reason = if cancelled_events.is_empty() {
-            self.cancel_reasons.remove(&channel_id);
-            None
-        } else {
-            self.cancel_reasons.remove(&channel_id)
-        };
+            .get_mut(&channel_id)
+            .and_then(VecDeque::pop_front);
+        if self
+            .cancelled_batches
+            .get(&channel_id)
+            .is_some_and(VecDeque::is_empty)
+        {
+            self.cancelled_batches.remove(&channel_id);
+        }
+        let (cancelled_events, cancel_reason) = cancelled.map_or_else(
+            || (vec![], None),
+            |batch| (batch.events, Some(batch.reason)),
+        );
 
         Some(FlushBatch {
             channel_id,
+            conversation_root: head_root,
             events,
             cancelled_events,
             cancel_reason,
@@ -407,6 +475,7 @@ impl EventQueue {
     /// `mark_complete` separately.
     pub fn requeue(&mut self, batch: FlushBatch) -> Option<FlushBatch> {
         let channel_id = batch.channel_id;
+        let conversation_root = batch.conversation_root.clone();
         let attempt = {
             let count = self.retry_counts.entry(channel_id).or_insert(0);
             *count += 1;
@@ -459,6 +528,7 @@ impl EventQueue {
                 event: be.event,
                 prompt_tag: be.prompt_tag,
                 received_at: be.received_at, // preserve original timestamp (#46)
+                conversation_root: conversation_root.clone(),
             });
         }
         // Enforce per-channel cap: trim oldest (back) events if requeue pushed
@@ -486,6 +556,7 @@ impl EventQueue {
     /// caller must call `mark_complete` separately.
     pub fn requeue_preserve_timestamps(&mut self, batch: FlushBatch) {
         let channel_id = batch.channel_id;
+        let conversation_root = batch.conversation_root.clone();
         let queue = self.queues.entry(channel_id).or_default();
         // Push to front in reverse order so original order is preserved.
         for be in batch.events.into_iter().rev() {
@@ -494,6 +565,7 @@ impl EventQueue {
                 event: be.event,
                 prompt_tag: be.prompt_tag,
                 received_at: be.received_at,
+                conversation_root: conversation_root.clone(),
             });
         }
         // Enforce per-channel cap: trim newest (back) events if over limit.
@@ -519,11 +591,26 @@ impl EventQueue {
     /// the generic queue — they are stored separately and merged by
     /// `flush_next()`. No retry throttle, no backoff.
     pub fn requeue_as_cancelled(&mut self, batch: FlushBatch, reason: CancelReason) {
-        let entry = self.cancelled_batches.entry(batch.channel_id).or_default();
-        // Preserve any already-cancelled events from a prior cancel (double-cancel).
-        entry.extend(batch.cancelled_events);
-        entry.extend(batch.events);
-        self.cancel_reasons.insert(batch.channel_id, reason);
+        let channel_id = batch.channel_id;
+        let conversation_root = batch.conversation_root;
+        let mut events = batch.cancelled_events;
+        events.extend(batch.events);
+        let batches = self.cancelled_batches.entry(channel_id).or_default();
+        if let Some(existing) = batches
+            .iter_mut()
+            .find(|existing| existing.conversation_root == conversation_root)
+        {
+            // Preserve any already-cancelled events for this same root. The most
+            // recent cancellation reason wins, matching prior double-cancel behavior.
+            existing.events.extend(events);
+            existing.reason = reason;
+        } else {
+            batches.push_back(CancelledBatch {
+                conversation_root,
+                events,
+                reason,
+            });
+        }
     }
 
     /// Returns `true` if any channel has pending events that are not in-flight
@@ -600,7 +687,6 @@ impl EventQueue {
         self.retry_after.remove(&channel_id);
         self.retry_counts.remove(&channel_id);
         self.cancelled_batches.remove(&channel_id);
-        self.cancel_reasons.remove(&channel_id);
         self.withheld_native_steer.remove(&channel_id);
         // Preserve in_flight_channels AND in_flight_deadlines: the in-flight
         // task will eventually complete (calling mark_complete) or the deadline
@@ -949,6 +1035,12 @@ pub enum ConversationContext {
         total: usize,
         truncated: bool,
     },
+    /// Recent channel roots for a fresh top-level session. Reply bodies are omitted.
+    Channel {
+        messages: Vec<ContextMessage>,
+        total: usize,
+        truncated: bool,
+    },
 }
 
 /// A single message in a conversation context section.
@@ -957,6 +1049,7 @@ pub struct ContextMessage {
     pub pubkey: String,
     pub timestamp: String,
     pub content: String,
+    pub has_replies: bool,
 }
 
 /// Channel metadata for prompt formatting.
@@ -1298,6 +1391,11 @@ fn format_conversation_context(
             total,
             truncated,
         } => ("Conversation Context", messages, total, truncated),
+        ConversationContext::Channel {
+            messages,
+            total,
+            truncated,
+        } => ("Channel Context", messages, total, truncated),
     };
 
     let trunc_label = if *truncated { ", truncated" } else { "" };
@@ -1313,6 +1411,9 @@ fn format_conversation_context(
             msg.timestamp,
             msg.content,
         ));
+        if msg.has_replies {
+            s.push_str(" [has thread replies]");
+        }
     }
     s
 }
@@ -1613,6 +1714,7 @@ mod tests {
     fn make_queued(channel_id: Uuid, content: &str) -> QueuedEvent {
         QueuedEvent {
             channel_id,
+            conversation_root: None,
             event: make_event(content),
             received_at: Instant::now(),
             prompt_tag: "test".into(),
@@ -1623,6 +1725,7 @@ mod tests {
     fn make_queued_at(channel_id: Uuid, content: &str, age: Duration) -> QueuedEvent {
         QueuedEvent {
             channel_id,
+            conversation_root: None,
             event: make_event(content),
             received_at: Instant::now() - age,
             prompt_tag: "test".into(),
@@ -1643,6 +1746,7 @@ mod tests {
             .unwrap();
         QueuedEvent {
             channel_id,
+            conversation_root: None,
             event,
             received_at: Instant::now(),
             prompt_tag: "test".into(),
@@ -1665,6 +1769,71 @@ mod tests {
         assert_eq!(base_section("hello"), "[Base]\nhello");
         // Internal newlines and leading whitespace are preserved verbatim.
         assert_eq!(base_section("  line1\nline2 "), "[Base]\n  line1\nline2");
+    }
+
+    #[test]
+    fn test_distinct_conversation_roots_are_flushed_in_separate_channel_batches() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let mut first = make_queued(ch, "first root");
+        first.conversation_root = Some("root-a".into());
+        let mut second = make_queued(ch, "second root");
+        second.conversation_root = Some("root-b".into());
+        q.push(first);
+        q.push(second);
+
+        let first_batch = q.flush_next().expect("first root should flush");
+        assert_eq!(first_batch.conversation_root.as_deref(), Some("root-a"));
+        assert_eq!(first_batch.events.len(), 1);
+        assert_eq!(pending_count(&q), 1);
+
+        // Scheduling remains channel-serialized even though session identity is root-scoped.
+        assert!(q.flush_next().is_none());
+        q.mark_complete(ch);
+        let second_batch = q
+            .flush_next()
+            .expect("second root should flush after completion");
+        assert_eq!(second_batch.conversation_root.as_deref(), Some("root-b"));
+        assert_eq!(second_batch.events.len(), 1);
+    }
+
+    #[test]
+    fn test_cancelled_root_is_redispatched_before_different_queued_root() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let mut root_a = make_queued(ch, "cancelled A");
+        root_a.conversation_root = Some("root-a".into());
+        q.push(root_a);
+        let batch_a = q.flush_next().expect("root A should flush");
+        q.requeue_as_cancelled(batch_a, CancelReason::Steer);
+        q.mark_complete(ch);
+
+        let mut root_b = make_queued(ch, "queued B");
+        root_b.conversation_root = Some("root-b".into());
+        q.push(root_b);
+
+        let redispatched_a = q.flush_next().expect("cancelled A should redispatch first");
+        assert_eq!(redispatched_a.conversation_root.as_deref(), Some("root-a"));
+        assert_eq!(redispatched_a.events[0].event.content, "cancelled A");
+        assert!(redispatched_a.cancelled_events.is_empty());
+        q.mark_complete(ch);
+
+        let dispatched_b = q.flush_next().expect("root B should remain queued");
+        assert_eq!(dispatched_b.conversation_root.as_deref(), Some("root-b"));
+        assert_eq!(dispatched_b.events[0].event.content, "queued B");
+        assert!(dispatched_b.cancelled_events.is_empty());
+    }
+
+    #[test]
+    fn test_disabled_mode_events_without_roots_still_batch_by_channel() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.push(make_queued(ch, "first"));
+        q.push(make_queued(ch, "second"));
+
+        let batch = q.flush_next().expect("channel batch should flush");
+        assert_eq!(batch.conversation_root, None);
+        assert_eq!(batch.events.len(), 2);
     }
 
     #[test]
@@ -1836,6 +2005,7 @@ mod tests {
             .unwrap_or_else(|_| event.pubkey.to_hex());
 
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -1867,6 +2037,7 @@ mod tests {
         let ch = Uuid::new_v4();
         FlushBatch {
             channel_id: ch,
+            conversation_root: None,
             events: vec![BatchEvent {
                 event: make_event("the new message"),
                 prompt_tag: "@mention".into(),
@@ -1997,6 +2168,7 @@ mod tests {
         // Multi-event header path must also branch on reason.
         let ch = Uuid::new_v4();
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![
                 BatchEvent {
@@ -2054,6 +2226,7 @@ mod tests {
         let _steering_id = steering.id.to_hex();
 
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event: steering,
@@ -2146,6 +2319,7 @@ mod tests {
         let e3 = make_event("third message");
 
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![
                 BatchEvent {
@@ -2186,6 +2360,7 @@ mod tests {
         let event = make_event("hello");
 
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -2209,6 +2384,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let event = make_event("hi");
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -2241,6 +2417,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let event = make_event("hi");
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -2271,6 +2448,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let event = make_event("hi");
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -2298,6 +2476,7 @@ mod tests {
         let event = make_event("hello");
 
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -2322,6 +2501,7 @@ mod tests {
         let event = make_event("hello");
 
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -2378,6 +2558,7 @@ mod tests {
         let event = make_event("hello");
 
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -2416,6 +2597,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let event = make_event("hello");
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -2428,6 +2610,7 @@ mod tests {
 
         let ctx = ConversationContext::Thread {
             messages: vec![ContextMessage {
+                has_replies: false,
                 pubkey: "npub1test".into(),
                 content: "prior message".into(),
                 timestamp: "2024-01-01T00:00:00Z".into(),
@@ -2646,6 +2829,7 @@ mod tests {
         let old_time = Instant::now() - Duration::from_secs(10);
 
         q.push(QueuedEvent {
+            conversation_root: None,
             channel_id: ch,
             event: make_event("old-msg"),
             received_at: old_time,
@@ -2933,6 +3117,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let event = make_event("hello");
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -2964,6 +3149,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let event = make_event("hey");
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -3002,6 +3188,7 @@ mod tests {
             ]],
         );
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -3030,6 +3217,7 @@ mod tests {
             ]],
         );
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -3042,11 +3230,13 @@ mod tests {
         let ctx = ConversationContext::Thread {
             messages: vec![
                 ContextMessage {
+                    has_replies: false,
                     pubkey: "npub1xyz".into(),
                     timestamp: "2026-03-15T16:30:00Z".into(),
                     content: "Let's refactor auth".into(),
                 },
                 ContextMessage {
+                    has_replies: false,
                     pubkey: "npub1def".into(),
                     timestamp: "2026-03-15T16:35:00Z".into(),
                     content: "yes go ahead".into(),
@@ -3074,6 +3264,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let event = make_event("ok do that");
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -3089,6 +3280,7 @@ mod tests {
         };
         let ctx = ConversationContext::Dm {
             messages: vec![ContextMessage {
+                has_replies: false,
                 pubkey: "npub1abc".into(),
                 timestamp: "2026-03-15T16:00:00Z".into(),
                 content: "Can you deploy?".into(),
@@ -3123,6 +3315,7 @@ mod tests {
         );
         let author_hex = event.pubkey.to_hex();
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -3134,6 +3327,7 @@ mod tests {
         };
         let ctx = ConversationContext::Thread {
             messages: vec![ContextMessage {
+                has_replies: false,
                 pubkey: author_hex.clone(),
                 timestamp: "2026-03-25T05:51:25Z".into(),
                 content: "follow up".into(),
@@ -3330,6 +3524,7 @@ mod tests {
             ]],
         );
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -3346,6 +3541,7 @@ mod tests {
         // Thread context fetched (as the fetch path does for DM replies).
         let ctx = ConversationContext::Thread {
             messages: vec![ContextMessage {
+                has_replies: false,
                 pubkey: "npub1xyz".into(),
                 timestamp: "2026-03-15T16:30:00Z".into(),
                 content: "Should I deploy?".into(),
@@ -3387,6 +3583,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let event = make_event("hey there");
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -3427,6 +3624,7 @@ mod tests {
         let event = make_event("test");
         let event_id = event.id.to_hex();
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -3451,6 +3649,7 @@ mod tests {
         let hex = event.pubkey.to_hex();
         let npub = event.pubkey.to_bech32().unwrap();
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -3474,6 +3673,7 @@ mod tests {
         // Kind 9 (stream message) — tags were previously stripped.
         let event = make_event_with_tags("hello", vec![vec!["h".into(), ch.to_string()]]);
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -3840,6 +4040,7 @@ mod tests {
             vec![vec!["e".into(), root_id.clone(), "".into(), "reply".into()]],
         );
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -3882,6 +4083,7 @@ mod tests {
         );
         let event_id = event.id.to_hex();
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -3916,6 +4118,7 @@ mod tests {
         let event = make_event("hello world");
         let event_id = event.id.to_hex();
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -3945,6 +4148,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let event = make_event("hey there");
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -3987,6 +4191,7 @@ mod tests {
         );
         let event_id = event.id.to_hex();
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -4023,6 +4228,7 @@ mod tests {
             vec![vec!["e".into(), root_id.clone(), "".into(), "reply".into()]],
         );
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event,
@@ -4058,6 +4264,7 @@ mod tests {
             vec![vec!["e".into(), root_id.clone(), "".into(), "reply".into()]],
         );
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![
                 BatchEvent {
@@ -4095,6 +4302,7 @@ mod tests {
         let plain = make_event("latest top-level");
         let plain_id = plain.id.to_hex();
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![
                 BatchEvent {
@@ -4129,6 +4337,7 @@ mod tests {
     fn make_single_batch(content: &str) -> FlushBatch {
         FlushBatch {
             channel_id: Uuid::new_v4(),
+            conversation_root: None,
             events: vec![BatchEvent {
                 event: make_event(content),
                 prompt_tag: "test".into(),
@@ -4422,6 +4631,7 @@ mod tests {
         let canvas = "[Channel Canvas]\nCanvas revision (event ID): abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234\nLast modified: 2024-01-15T10:30:00+00:00\nFetch current content with: buzz canvas get --channel 00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae";
         let ch = Uuid::new_v4();
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event: make_event("hi"),
@@ -4451,6 +4661,7 @@ mod tests {
         let canvas = "[Channel Canvas]\nCanvas revision (event ID): abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234\nLast modified: 2024-01-15T10:30:00+00:00\nFetch current content with: buzz canvas get --channel 00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae";
         let ch = Uuid::new_v4();
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event: make_event("hi"),
@@ -4479,6 +4690,7 @@ mod tests {
     fn test_format_prompt_no_canvas_produces_no_canvas_section() {
         let ch = Uuid::new_v4();
         let batch = FlushBatch {
+            conversation_root: None,
             channel_id: ch,
             events: vec![BatchEvent {
                 event: make_event("hi"),

@@ -760,3 +760,50 @@ fn own_group_grandchild_detected_by_ancestor_walk() {
     unsafe { libc::kill(-(intermediate_pid as i32), libc::SIGKILL) };
     let _ = intermediate.wait();
 }
+
+fn command_env(command: &std::process::Command) -> std::collections::HashMap<
+    std::ffi::OsString,
+    std::ffi::OsString,
+> {
+    command
+        .get_envs()
+        .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
+        .collect()
+}
+
+#[test]
+fn top_level_sessions_enabled_finalization_overrides_conflicting_later_env() {
+    let mut command = std::process::Command::new("buzz-acp");
+    // Simulate conflicting runtime defaults/user env written after Buzz's legacy defaults.
+    command.env("BUZZ_ACP_TOP_LEVEL_SESSIONS", "false");
+    command.env("BUZZ_ACP_MULTIPLE_EVENT_HANDLING", "steer");
+    super::finalize_acp_top_level_sessions_env(&mut command, true);
+    let env = command_env(&command);
+    assert_eq!(
+        env.get(std::ffi::OsStr::new("BUZZ_ACP_TOP_LEVEL_SESSIONS"))
+            .unwrap(),
+        "true"
+    );
+    assert_eq!(
+        env.get(std::ffi::OsStr::new("BUZZ_ACP_MULTIPLE_EVENT_HANDLING"))
+            .unwrap(),
+        "queue"
+    );
+}
+
+#[test]
+fn top_level_sessions_disabled_removes_flag_but_preserves_handling_override() {
+    let mut command = std::process::Command::new("buzz-acp");
+    // Simulate conflicting later user env: the new flag is suppressed while the
+    // pre-existing handling override remains compatible when experiment is off.
+    command.env("BUZZ_ACP_TOP_LEVEL_SESSIONS", "true");
+    command.env("BUZZ_ACP_MULTIPLE_EVENT_HANDLING", "interrupt");
+    super::finalize_acp_top_level_sessions_env(&mut command, false);
+    let env = command_env(&command);
+    assert!(!env.contains_key(std::ffi::OsStr::new("BUZZ_ACP_TOP_LEVEL_SESSIONS")));
+    assert_eq!(
+        env.get(std::ffi::OsStr::new("BUZZ_ACP_MULTIPLE_EVENT_HANDLING"))
+            .unwrap(),
+        "interrupt"
+    );
+}

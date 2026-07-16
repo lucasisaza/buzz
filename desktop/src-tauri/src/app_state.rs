@@ -25,6 +25,8 @@ pub struct AppState {
     /// restore. `apply_workspace` consumes it after installing the workspace
     /// relay and identity, so agents never start against the fallback relay.
     pub managed_agent_restore_pending: AtomicBool,
+    /// Process-local in-app experiment forwarded to newly spawned ACP harnesses.
+    pub acp_top_level_sessions_experiment: AtomicBool,
     /// Shared shutdown signal checked by launch-time agent restoration.
     pub shutdown_started: AtomicBool,
     /// Serializes the restore spawn/register transition with shutdown cleanup,
@@ -161,6 +163,7 @@ pub fn build_app_state() -> AppState {
             .unwrap_or_else(|_| reqwest::Client::new()),
         relay_url_override: Mutex::new(None),
         managed_agent_restore_pending: AtomicBool::new(false),
+        acp_top_level_sessions_experiment: AtomicBool::new(false),
         shutdown_started: AtomicBool::new(false),
         managed_agent_restore_transition: Mutex::new(()),
         identity_mutation: Mutex::new(()),
