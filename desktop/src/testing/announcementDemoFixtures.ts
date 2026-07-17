@@ -18,12 +18,69 @@ export type AnnouncementDemoChannelRole =
 
 export const ANNOUNCEMENT_DEMO_COMMUNITY_NAME = "Honeycomb Studios";
 
-export const ANNOUNCEMENT_DEMO_AGENT = {
-  pubkey: "70".repeat(32),
-  name: "Scout",
-  systemPrompt:
-    "You are Scout, a concise and thoughtful AI teammate at Honeycomb Studios. Help the team prepare the Buzz announcement, turn loose ideas into clear next steps, and keep replies conversational. In channels, answer in one to four sentences unless someone asks for more detail.",
-  channelNames: ["flight-path", "design", "marketing", "queen-bee-launch"],
+export const ANNOUNCEMENT_DEMO_AGENTS = [
+  {
+    pubkey: "70".repeat(32),
+    name: "Fizz",
+    avatarUrl: "/demo/agents/fizz.png",
+    systemPrompt:
+      "You are Fizz, an energetic maker who turns ideas into action. Be upbeat, practical, and decisive. Help users plan, create, solve problems, and finish work. Add occasional bee wordplay or 🐝✨—keep it charming, never distracting.",
+    channelNames: ["flight-path", "design", "marketing", "queen-bee-launch"],
+  },
+  {
+    pubkey: "71".repeat(32),
+    name: "Honey",
+    avatarUrl: "/demo/agents/honey.png",
+    systemPrompt:
+      "You are Honey, a warm and thoughtful communicator. Help users write clearly, organize ideas, brainstorm, summarize, and prepare for conversations. Be kind, creative, and concise. Add occasional bee wordplay or 🍯🐝—keep it sweet, never excessive.",
+    channelNames: ["flight-path", "design", "marketing", "queen-bee-launch"],
+  },
+  {
+    pubkey: "72".repeat(32),
+    name: "Bumble",
+    avatarUrl: "/demo/agents/bumble.png",
+    systemPrompt:
+      "You are Bumble, a curious and adventurous researcher. Explore questions, compare options, check assumptions, and explain what you find clearly. Be candid when uncertain and favor useful evidence. Add occasional bee wordplay or 🐝🔎—keep it playful, never chaotic.",
+    channelNames: ["flight-path", "design", "marketing", "queen-bee-launch"],
+  },
+] as const;
+
+export type AnnouncementDemoAgentName =
+  (typeof ANNOUNCEMENT_DEMO_AGENTS)[number]["name"];
+
+export const ANNOUNCEMENT_DEMO_LIVE_CONVERSATION = {
+  channelName: "flight-path",
+  steps: [
+    {
+      delayMs: 1_800,
+      author: "engineer",
+      content:
+        "Small thing: the desktop-to-mobile handoff still feels a little fast.",
+      agentMentions: [],
+      startsAgentChain: false,
+    },
+    {
+      delayMs: 2_200,
+      author: "designer",
+      content: "Yeah — I want one extra beat on the sent message.",
+      agentMentions: [],
+      startsAgentChain: false,
+    },
+    {
+      delayMs: 2_000,
+      author: "producer",
+      content: "That would give the camera somewhere to land too.",
+      agentMentions: [],
+      startsAgentChain: false,
+    },
+    {
+      delayMs: 2_200,
+      author: "engineer",
+      content: "@Fizz can you turn that into a clean three-beat capture plan?",
+      agentMentions: ["Fizz"],
+      startsAgentChain: true,
+    },
+  ],
 } as const;
 
 export const ANNOUNCEMENT_DEMO_PEOPLE = {

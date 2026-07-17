@@ -9,7 +9,7 @@ import { migrateLegacyCommunityStorageBeforeRender } from "@/features/communitie
 import { CommunitiesProvider } from "@/features/communities/useCommunities";
 import { CommunityOnboardingProvider } from "@/features/onboarding/communityOnboarding";
 import {
-  ANNOUNCEMENT_DEMO_AGENT,
+  ANNOUNCEMENT_DEMO_AGENTS,
   ANNOUNCEMENT_DEMO_COMMUNITY_NAME,
   ANNOUNCEMENT_DEMO_PEOPLE,
   ANNOUNCEMENT_DEMO_SECTION_STORE,
@@ -58,6 +58,9 @@ function configureMockBridgeFromUrl() {
   const isAnnouncementDemo =
     url.searchParams.get("demo") === ANNOUNCEMENT_DEMO_QUERY_VALUE ||
     import.meta.env.VITE_ANNOUNCEMENT_DEMO === "1";
+  const mockRelayWsUrl = isAnnouncementDemo
+    ? `${url.protocol === "https:" ? "wss:" : "ws:"}//${url.host}`
+    : "ws://localhost:3000";
 
   if (!isDevE2eMock && !isAnnouncementDemo) {
     return;
@@ -67,18 +70,19 @@ function configureMockBridgeFromUrl() {
   if (isAnnouncementDemo) {
     e2eWindow.__BUZZ_E2E__ = {
       mode: "mock",
+      relayHttpUrl: url.origin,
+      relayWsUrl: mockRelayWsUrl,
       mock: {
         announcementDemo: true,
-        managedAgents: [
-          {
-            pubkey: ANNOUNCEMENT_DEMO_AGENT.pubkey,
-            name: ANNOUNCEMENT_DEMO_AGENT.name,
-            systemPrompt: ANNOUNCEMENT_DEMO_AGENT.systemPrompt,
-            status: "running",
-            channelNames: [...ANNOUNCEMENT_DEMO_AGENT.channelNames],
-            respondTo: "owner-only",
-          },
-        ],
+        managedAgents: ANNOUNCEMENT_DEMO_AGENTS.map((agent) => ({
+          pubkey: agent.pubkey,
+          name: agent.name,
+          avatarUrl: agent.avatarUrl,
+          systemPrompt: agent.systemPrompt,
+          status: "running" as const,
+          channelNames: [...agent.channelNames],
+          respondTo: "owner-only" as const,
+        })),
       },
     };
   } else {
@@ -89,7 +93,7 @@ function configureMockBridgeFromUrl() {
     addedAt: new Date().toISOString(),
     id: E2E_COMMUNITY_ID,
     name: isAnnouncementDemo ? ANNOUNCEMENT_DEMO_COMMUNITY_NAME : "E2E Test",
-    relayUrl: "ws://localhost:3000",
+    relayUrl: mockRelayWsUrl,
   };
   window.localStorage.setItem("buzz-communities", JSON.stringify([community]));
   window.localStorage.setItem("buzz-active-community-id", E2E_COMMUNITY_ID);
@@ -99,13 +103,13 @@ function configureMockBridgeFromUrl() {
   );
 
   if (isAnnouncementDemo) {
-    const relayStorageScope = encodeURIComponent("ws://localhost:3000");
+    const relayStorageScope = encodeURIComponent(mockRelayWsUrl);
     window.localStorage.setItem(
       `${CHANNEL_SECTIONS_STORAGE_KEY_PREFIX}:${E2E_DEFAULT_PUBKEY}:${relayStorageScope}`,
       JSON.stringify(ANNOUNCEMENT_DEMO_SECTION_STORE),
     );
     window.localStorage.setItem(
-      `${SELF_PROFILE_STORAGE_KEY_PREFIX}:ws://localhost:3000:${E2E_DEFAULT_PUBKEY}`,
+      `${SELF_PROFILE_STORAGE_KEY_PREFIX}:${mockRelayWsUrl}:${E2E_DEFAULT_PUBKEY}`,
       JSON.stringify({
         version: 1,
         displayName: ANNOUNCEMENT_DEMO_PEOPLE.viewer.displayName,

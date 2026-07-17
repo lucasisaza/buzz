@@ -496,7 +496,7 @@ announcement-demo:
     [[ -d node_modules ]] || pnpm install
     source ../scripts/instance-env.sh
     demo_url="http://127.0.0.1:${BUZZ_VITE_PORT}/?demo=announcement"
-    pnpm exec vite --port "${BUZZ_VITE_PORT}" --strictPort &
+    pnpm exec vite --host 127.0.0.1 --port "${BUZZ_VITE_PORT}" --strictPort &
     vite_pid=$!
     trap 'kill "$vite_pid" 2>/dev/null || true' EXIT
     for _ in $(seq 1 40); do

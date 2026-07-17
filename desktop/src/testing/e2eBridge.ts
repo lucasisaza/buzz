@@ -50,12 +50,15 @@ import type {
 } from "@/shared/api/tauri";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import {
+  ANNOUNCEMENT_DEMO_AGENTS,
   ANNOUNCEMENT_DEMO_CHANNELS,
   ANNOUNCEMENT_DEMO_DMS,
+  ANNOUNCEMENT_DEMO_LIVE_CONVERSATION,
   ANNOUNCEMENT_DEMO_MESSAGES,
   ANNOUNCEMENT_DEMO_PEOPLE,
   ANNOUNCEMENT_DEMO_PROJECT_SUBJECTS,
   ANNOUNCEMENT_DEMO_PROJECTS,
+  type AnnouncementDemoAgentName,
   type AnnouncementDemoPersonKey,
 } from "@/testing/announcementDemoFixtures";
 
@@ -1973,21 +1976,55 @@ function resetMockManagedAgents(config?: E2eConfig) {
   const savedState = config?.mock?.announcementDemo
     ? readAnnouncementDemoAgentState()
     : null;
+  const configuredEntries = (config?.mock?.managedAgents ?? []).map((seed) => ({
+    agent: buildSeededManagedAgent(seed),
+    channelIds: mockChannels
+      .filter(
+        (channel) =>
+          seed.channelIds?.includes(channel.id) ||
+          seed.channelNames?.includes(channel.name),
+      )
+      .map((channel) => channel.id),
+  }));
+  const configuredPubkeys = new Set(
+    configuredEntries.map(({ agent }) => normalizePubkey(agent.pubkey)),
+  );
   const entries = savedState
-    ? savedState.agents.map((saved) => ({
-        agent: cloneSavedManagedAgent(saved.agent),
-        channelIds: saved.channelIds,
-      }))
-    : (config?.mock?.managedAgents ?? []).map((seed) => ({
-        agent: buildSeededManagedAgent(seed),
-        channelIds: mockChannels
+    ? [
+        ...configuredEntries.map((configured) => {
+          const saved = savedState.agents.find(
+            ({ agent }) =>
+              normalizePubkey(agent.pubkey) ===
+              normalizePubkey(configured.agent.pubkey),
+          );
+          if (!saved) {
+            return configured;
+          }
+          return {
+            agent: {
+              ...cloneSavedManagedAgent(saved.agent),
+              name: configured.agent.name,
+              system_prompt: configured.agent.system_prompt,
+              avatar_url: configured.agent.avatar_url,
+              status: configured.agent.status,
+              pid: configured.agent.pid,
+            },
+            channelIds: [
+              ...new Set([...saved.channelIds, ...configured.channelIds]),
+            ],
+          };
+        }),
+        ...savedState.agents
           .filter(
-            (channel) =>
-              seed.channelIds?.includes(channel.id) ||
-              seed.channelNames?.includes(channel.name),
+            ({ agent }) =>
+              !configuredPubkeys.has(normalizePubkey(agent.pubkey)),
           )
-          .map((channel) => channel.id),
-      }));
+          .map((saved) => ({
+            agent: cloneSavedManagedAgent(saved.agent),
+            channelIds: saved.channelIds,
+          })),
+      ]
+    : configuredEntries;
 
   for (const { agent, channelIds } of entries) {
     mockManagedAgents.push(agent);
@@ -2684,6 +2721,7 @@ let mockWebsocketSendMutexWedged = false;
 const realSockets = new Map<number, WebSocket>();
 let mockManagedAgents: MockManagedAgent[] = [];
 const pendingAnnouncementDemoAgentResponses = new Set<string>();
+let announcementDemoLiveConversationStarted = false;
 let mockGlobalAgentConfig: MockGlobalAgentConfig = {
   env_vars: {},
   provider: null,
@@ -3959,6 +3997,14 @@ function emitMockHistory(
 }
 
 function emitMockLiveEvent(channelId: string, event: RelayEvent) {
+  if (getConfig()?.mock?.announcementDemo && event.kind === 9) {
+    window.dispatchEvent(
+      new CustomEvent("buzz:follow-channel-tail", {
+        detail: { channelId },
+      }),
+    );
+  }
+
   for (const socket of mockSockets.values()) {
     for (const [subId, subscription] of socket.subscriptions) {
       if (
@@ -4001,7 +4047,11 @@ function hasMockLiveSubscription(channelId: string, kind?: number) {
   return false;
 }
 
-function recordMockMessage(channelId: string, event: RelayEvent) {
+function recordMockMessage(
+  channelId: string,
+  event: RelayEvent,
+  queueAgentResponses = true,
+) {
   const history = getMockMessageStore(channelId);
   history.push(event);
 
@@ -4012,7 +4062,9 @@ function recordMockMessage(channelId: string, event: RelayEvent) {
 
   channel.last_message_at = new Date(event.created_at * 1_000).toISOString();
   touchMockChannel(channel);
-  queueAnnouncementDemoAgentResponses(channelId, event);
+  if (queueAgentResponses) {
+    queueAnnouncementDemoAgentResponses(channelId, event);
+  }
 }
 
 function resetMockUserStatuses() {
@@ -4154,9 +4206,9 @@ function emitMockTypingIndicator(channelId: string, pubkey: string) {
 }
 
 type AnnouncementDemoProviderConfig = {
-  provider: "anthropic" | "openai";
-  apiKey: string;
-  model: string;
+  provider: "anthropic" | "openai" | null;
+  apiKey: string | null;
+  model: string | null;
 };
 
 type AnnouncementDemoAgentReply = {
@@ -4191,39 +4243,32 @@ function getAnnouncementDemoProviderConfig(
         : env.ANTHROPIC_API_KEY?.trim()
           ? "anthropic"
           : null;
-  if (!provider) {
-    throw new Error(
-      "Choose Anthropic or OpenAI and add its API key in agent settings.",
-    );
-  }
-
-  const model = (
-    agent.model ??
-    env.BUZZ_AGENT_MODEL ??
-    env.GOOSE_MODEL ??
-    env.OPENAI_COMPAT_MODEL ??
-    mockGlobalAgentConfig.model ??
-    ""
-  ).trim();
-  if (!model) {
-    throw new Error("Choose a model in agent settings.");
-  }
+  const model =
+    (
+      agent.model ??
+      env.BUZZ_AGENT_MODEL ??
+      env.GOOSE_MODEL ??
+      env.OPENAI_COMPAT_MODEL ??
+      mockGlobalAgentConfig.model ??
+      ""
+    ).trim() || null;
 
   const apiKey =
     provider === "openai"
       ? env.OPENAI_COMPAT_API_KEY?.trim() || env.OPENAI_API_KEY?.trim()
-      : env.ANTHROPIC_API_KEY?.trim();
-  if (!apiKey) {
-    throw new Error(
-      `Add an ${provider === "openai" ? "OpenAI" : "Anthropic"} API key in agent settings.`,
-    );
-  }
+      : provider === "anthropic"
+        ? env.ANTHROPIC_API_KEY?.trim()
+        : null;
 
-  return { provider, apiKey, model };
+  return { provider, apiKey: apiKey || null, model };
 }
 
 function getAnnouncementDemoAgentTargets(channelId: string, event: RelayEvent) {
-  if (event.kind !== 9 || mockAgentPubkeys.has(normalizePubkey(event.pubkey))) {
+  const isAgentAuthored = mockAgentPubkeys.has(normalizePubkey(event.pubkey));
+  const isAgentChainEvent = event.tags.some(
+    (tag) => tag[0] === ANNOUNCEMENT_DEMO_AGENT_CHAIN_TAG,
+  );
+  if (event.kind !== 9 || (isAgentAuthored && !isAgentChainEvent)) {
     return [];
   }
 
@@ -4240,14 +4285,56 @@ function getAnnouncementDemoAgentTargets(channelId: string, event: RelayEvent) {
     channel.channel_type === "dm"
       ? new Set(channel.members.map((member) => normalizePubkey(member.pubkey)))
       : new Set<string>();
+  const sourceAgentIndex = isAgentAuthored
+    ? ANNOUNCEMENT_DEMO_AGENTS.findIndex(
+        (candidate) =>
+          normalizePubkey(candidate.pubkey) === normalizePubkey(event.pubkey),
+      )
+    : -1;
 
   return mockManagedAgents.filter((agent) => {
     const pubkey = normalizePubkey(agent.pubkey);
     const isActive = agent.status === "running" || agent.status === "deployed";
+    if (isAgentAuthored) {
+      const targetAgentIndex = ANNOUNCEMENT_DEMO_AGENTS.findIndex(
+        (candidate) => normalizePubkey(candidate.pubkey) === pubkey,
+      );
+      if (targetAgentIndex !== sourceAgentIndex + 1) {
+        return false;
+      }
+    }
     return (
       isActive && (mentionedPubkeys.has(pubkey) || dmMemberPubkeys.has(pubkey))
     );
   });
+}
+
+function getAnnouncementDemoNextAgent(
+  sourceEvent: RelayEvent,
+  agent: MockManagedAgent,
+) {
+  const isAgentChainEvent = sourceEvent.tags.some(
+    (tag) => tag[0] === ANNOUNCEMENT_DEMO_AGENT_CHAIN_TAG,
+  );
+  if (!isAgentChainEvent) {
+    return null;
+  }
+
+  const currentIndex = ANNOUNCEMENT_DEMO_AGENTS.findIndex(
+    (candidate) =>
+      normalizePubkey(candidate.pubkey) === normalizePubkey(agent.pubkey),
+  );
+  const nextDefinition = ANNOUNCEMENT_DEMO_AGENTS[currentIndex + 1];
+  if (!nextDefinition) {
+    return null;
+  }
+  return (
+    mockManagedAgents.find(
+      (candidate) =>
+        normalizePubkey(candidate.pubkey) ===
+        normalizePubkey(nextDefinition.pubkey),
+    ) ?? null
+  );
 }
 
 function getAnnouncementDemoConversation(
@@ -4277,6 +4364,7 @@ function getAnnouncementDemoConversation(
 function getAnnouncementDemoSystemPrompt(
   channelId: string,
   agent: MockManagedAgent,
+  sourceEvent: RelayEvent,
 ) {
   const channel = mockChannels.find((candidate) => candidate.id === channelId);
   const basePrompt =
@@ -4286,12 +4374,22 @@ function getAnnouncementDemoSystemPrompt(
     channel?.channel_type === "dm"
       ? "a direct message"
       : `#${channel?.name ?? "a team channel"}`;
-  return `${basePrompt}\n\nYou are replying in ${location}. Use the conversation context, sound like a real colleague, and do not prefix the reply with your name.`;
+  const nextAgent = getAnnouncementDemoNextAgent(sourceEvent, agent);
+  const isAgentChainEvent = sourceEvent.tags.some(
+    (tag) => tag[0] === ANNOUNCEMENT_DEMO_AGENT_CHAIN_TAG,
+  );
+  const collaborationInstruction = nextAgent
+    ? ` This is a collaborative team turn: answer the previous teammate directly, then finish with a short, natural handoff to @${nextAgent.name}. Include exactly @${nextAgent.name} in the reply.`
+    : isAgentChainEvent
+      ? " This is the final turn in a short agent collaboration: respond directly to the previous agent, share one useful check or refinement, and close the loop without handing off again."
+      : "";
+  return `${basePrompt}\n\nYou are replying in ${location}. Use the conversation context, sound like a real colleague, and do not prefix the reply with your name.${collaborationInstruction}`;
 }
 
 async function requestAnnouncementDemoAgentReply(
   channelId: string,
   agent: MockManagedAgent,
+  sourceEvent: RelayEvent,
 ) {
   const provider = getAnnouncementDemoProviderConfig(agent);
   const response = await fetch("/__announcement-demo/agent-response", {
@@ -4299,7 +4397,11 @@ async function requestAnnouncementDemoAgentReply(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       ...provider,
-      systemPrompt: getAnnouncementDemoSystemPrompt(channelId, agent),
+      systemPrompt: getAnnouncementDemoSystemPrompt(
+        channelId,
+        agent,
+        sourceEvent,
+      ),
       messages: getAnnouncementDemoConversation(channelId, agent),
     }),
   });
@@ -4329,7 +4431,18 @@ function publishAnnouncementDemoAgentReply(
   sourceEvent: RelayEvent,
   agent: MockManagedAgent,
   content: string,
+  continueAgentChain = true,
 ) {
+  const isAgentChainEvent = sourceEvent.tags.some(
+    (tag) => tag[0] === ANNOUNCEMENT_DEMO_AGENT_CHAIN_TAG,
+  );
+  const nextAgent = continueAgentChain
+    ? getAnnouncementDemoNextAgent(sourceEvent, agent)
+    : null;
+  const mentionPubkeys = [
+    sourceEvent.pubkey,
+    ...(nextAgent ? [nextAgent.pubkey] : []),
+  ];
   const sourceThread = getThreadReferenceFromTags(sourceEvent.tags);
   const tags = sourceThread.rootEventId
     ? buildReplyMessageTags(
@@ -4337,18 +4450,106 @@ function publishAnnouncementDemoAgentReply(
         agent.pubkey,
         sourceEvent.id,
         sourceThread.rootEventId,
-        [sourceEvent.pubkey],
+        mentionPubkeys,
       )
-    : buildTopLevelMessageTags(channelId, [sourceEvent.pubkey], agent.pubkey);
+    : buildTopLevelMessageTags(channelId, mentionPubkeys, agent.pubkey);
+  if (isAgentChainEvent && continueAgentChain) {
+    tags.push([ANNOUNCEMENT_DEMO_AGENT_CHAIN_TAG, "1"]);
+  }
   const event = createMockEvent(
     9,
     content,
     tags,
     agent.pubkey,
     Math.max(Math.floor(Date.now() / 1_000), sourceEvent.created_at + 1),
+    mockEventId(),
   );
-  recordMockMessage(channelId, event);
+  recordMockMessage(channelId, event, !nextAgent);
   emitMockLiveEvent(channelId, event);
+  if (nextAgent) {
+    window.setTimeout(
+      () => queueAnnouncementDemoAgentResponses(channelId, event),
+      ANNOUNCEMENT_DEMO_AGENT_HANDOFF_DELAY_MS,
+    );
+  } else if (isAgentChainEvent && continueAgentChain) {
+    const producerPubkey = getAnnouncementDemoPersonPubkey("producer");
+    window.setTimeout(() => {
+      emitMockTypingIndicator(channelId, producerPubkey);
+      window.setTimeout(
+        () =>
+          emitMockChannelMessage(
+            channelId,
+            "That’s the version. I can cut to that — nice swarm work 🐝",
+            null,
+            producerPubkey,
+            9,
+            undefined,
+            [["announcement-demo-live", "1"]],
+            undefined,
+            mockEventId(),
+          ),
+        650,
+      );
+    }, ANNOUNCEMENT_DEMO_HUMAN_CLOSE_DELAY_MS);
+  }
+}
+
+const ANNOUNCEMENT_DEMO_AGENT_CHAIN_TAG = "announcement-demo-agent-chain";
+const ANNOUNCEMENT_DEMO_AGENT_SEEN_REACTION = "👀";
+const ANNOUNCEMENT_DEMO_AGENT_WORKING_REACTION = "💬";
+const ANNOUNCEMENT_DEMO_AGENT_WORKING_DELAY_MS = 350;
+const ANNOUNCEMENT_DEMO_AGENT_MIN_TURN_MS = 1_800;
+const ANNOUNCEMENT_DEMO_AGENT_REACTION_CLEANUP_DELAY_MS = 2_500;
+const ANNOUNCEMENT_DEMO_AGENT_HANDOFF_DELAY_MS = 700;
+const ANNOUNCEMENT_DEMO_HUMAN_CLOSE_DELAY_MS = 700;
+
+function publishAnnouncementDemoAgentReaction(
+  channelId: string,
+  sourceEvent: RelayEvent,
+  agent: MockManagedAgent,
+  emoji: string,
+) {
+  const reaction = createMockEvent(
+    KIND_REACTION,
+    emoji,
+    [["e", sourceEvent.id]],
+    agent.pubkey,
+    Math.floor(Date.now() / 1_000),
+    mockEventId(),
+  );
+  recordMockMessage(channelId, reaction);
+  emitMockLiveEvent(channelId, reaction);
+}
+
+function clearAnnouncementDemoAgentReactions(
+  channelId: string,
+  sourceEvent: RelayEvent,
+  agent: MockManagedAgent,
+) {
+  const store = getMockMessageStore(channelId);
+  const reactions = store.filter(
+    (event) =>
+      event.kind === KIND_REACTION &&
+      normalizePubkey(event.pubkey) === normalizePubkey(agent.pubkey) &&
+      (event.content === ANNOUNCEMENT_DEMO_AGENT_SEEN_REACTION ||
+        event.content === ANNOUNCEMENT_DEMO_AGENT_WORKING_REACTION) &&
+      event.tags.some((tag) => tag[0] === "e" && tag[1] === sourceEvent.id),
+  );
+
+  for (const reaction of reactions) {
+    const index = store.indexOf(reaction);
+    if (index >= 0) {
+      store.splice(index, 1);
+    }
+    const deletion = createMockEvent(
+      KIND_DELETION,
+      "",
+      [["e", reaction.id]],
+      agent.pubkey,
+    );
+    recordMockMessage(channelId, deletion);
+    emitMockLiveEvent(channelId, deletion);
+  }
 }
 
 function queueAnnouncementDemoAgentResponses(
@@ -4365,15 +4566,39 @@ function queueAnnouncementDemoAgentResponses(
       continue;
     }
     pendingAnnouncementDemoAgentResponses.add(responseKey);
+    const turnStartedAt = Date.now();
+    publishAnnouncementDemoAgentReaction(
+      channelId,
+      sourceEvent,
+      agent,
+      ANNOUNCEMENT_DEMO_AGENT_SEEN_REACTION,
+    );
+    const workingReactionTimer = window.setTimeout(
+      () =>
+        publishAnnouncementDemoAgentReaction(
+          channelId,
+          sourceEvent,
+          agent,
+          ANNOUNCEMENT_DEMO_AGENT_WORKING_REACTION,
+        ),
+      ANNOUNCEMENT_DEMO_AGENT_WORKING_DELAY_MS,
+    );
     emitMockTypingIndicator(channelId, agent.pubkey);
     const typingInterval = window.setInterval(
       () => emitMockTypingIndicator(channelId, agent.pubkey),
       2_500,
     );
+    const waitForVisibleTurn = async () => {
+      const remainingMs =
+        ANNOUNCEMENT_DEMO_AGENT_MIN_TURN_MS - (Date.now() - turnStartedAt);
+      if (remainingMs > 0) {
+        await new Promise((resolve) => window.setTimeout(resolve, remainingMs));
+      }
+    };
 
-    void requestAnnouncementDemoAgentReply(channelId, agent)
+    void requestAnnouncementDemoAgentReply(channelId, agent, sourceEvent)
       .then(async (reply) => {
-        await new Promise((resolve) => window.setTimeout(resolve, 650));
+        await waitForVisibleTurn();
         agent.last_error = null;
         agent.last_error_code = null;
         agent.log_lines.push(
@@ -4381,7 +4606,8 @@ function queueAnnouncementDemoAgentResponses(
         );
         publishAnnouncementDemoAgentReply(channelId, sourceEvent, agent, reply);
       })
-      .catch((error: unknown) => {
+      .catch(async (error: unknown) => {
+        await waitForVisibleTurn();
         const detail = error instanceof Error ? error.message : String(error);
         agent.last_error = detail;
         agent.log_lines.push(`announcement demo turn failed: ${detail}`);
@@ -4390,13 +4616,73 @@ function queueAnnouncementDemoAgentResponses(
           sourceEvent,
           agent,
           announcementDemoAgentFailureMessage(error),
+          false,
         );
       })
       .finally(() => {
+        window.clearTimeout(workingReactionTimer);
         window.clearInterval(typingInterval);
         pendingAnnouncementDemoAgentResponses.delete(responseKey);
         persistAnnouncementDemoAgentState();
+        window.setTimeout(
+          () =>
+            clearAnnouncementDemoAgentReactions(channelId, sourceEvent, agent),
+          ANNOUNCEMENT_DEMO_AGENT_REACTION_CLEANUP_DELAY_MS,
+        );
       });
+  }
+}
+
+function maybeStartAnnouncementDemoLiveConversation(channelId: string) {
+  if (
+    announcementDemoLiveConversationStarted ||
+    !getConfig()?.mock?.announcementDemo
+  ) {
+    return;
+  }
+
+  const channel = mockChannels.find((candidate) => candidate.id === channelId);
+  if (channel?.name !== ANNOUNCEMENT_DEMO_LIVE_CONVERSATION.channelName) {
+    return;
+  }
+
+  announcementDemoLiveConversationStarted = true;
+  let elapsedMs = 0;
+  for (const step of ANNOUNCEMENT_DEMO_LIVE_CONVERSATION.steps) {
+    elapsedMs += step.delayMs;
+    const authorPubkey = getAnnouncementDemoPersonPubkey(step.author);
+    window.setTimeout(
+      () => emitMockTypingIndicator(channelId, authorPubkey),
+      Math.max(0, elapsedMs - 850),
+    );
+    window.setTimeout(() => {
+      const agentMentionPubkeys = (
+        step.agentMentions as readonly AnnouncementDemoAgentName[]
+      ).map((name) => {
+        const agent = ANNOUNCEMENT_DEMO_AGENTS.find(
+          (candidate) => candidate.name === name,
+        );
+        if (!agent) {
+          throw new Error(`Unknown announcement demo agent: ${name}`);
+        }
+        return agent.pubkey;
+      });
+      const extraTags = [["announcement-demo-live", "1"]];
+      if (step.startsAgentChain) {
+        extraTags.push([ANNOUNCEMENT_DEMO_AGENT_CHAIN_TAG, "1"]);
+      }
+      emitMockChannelMessage(
+        channelId,
+        step.content,
+        null,
+        authorPubkey,
+        9,
+        agentMentionPubkeys.length > 0 ? agentMentionPubkeys : undefined,
+        extraTags,
+        undefined,
+        mockEventId(),
+      );
+    }, elapsedMs);
   }
 }
 
@@ -8376,14 +8662,21 @@ async function handleSendChannelMessage(
     const mockPubkey = getMockMemberPubkey(config);
 
     if (!args.parentEventId) {
-      const event = createMockEvent(kind, args.content, [
-        ...buildTopLevelMessageTags(
-          args.channelId,
-          args.mentionPubkeys,
-          mockPubkey,
-        ),
-        ...extraTags,
-      ]);
+      const event = createMockEvent(
+        kind,
+        args.content,
+        [
+          ...buildTopLevelMessageTags(
+            args.channelId,
+            args.mentionPubkeys,
+            mockPubkey,
+          ),
+          ...extraTags,
+        ],
+        mockPubkey,
+        createdAt,
+        config?.mock?.announcementDemo ? mockEventId() : undefined,
+      );
       recordMockMessage(args.channelId, event);
       emitMockLiveEvent(args.channelId, event);
 
@@ -8959,6 +9252,9 @@ function sendToMockSocket(args: {
         channelId: onlyChannelId ?? GLOBAL_MOCK_SUBSCRIPTION,
         kinds: kinds.size > 0 ? [...kinds] : null,
       });
+      for (const channelId of channelIds) {
+        maybeStartAnnouncementDemoLiveConversation(channelId);
+      }
       sendWsText(socket.handler, ["EOSE", subId]);
       return;
     }

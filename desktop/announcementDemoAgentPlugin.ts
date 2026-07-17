@@ -1,6 +1,7 @@
-import type { Plugin } from "vite";
+import { loadEnv, type Plugin } from "vite";
 
 const AGENT_RESPONSE_PATH = "/__announcement-demo/agent-response";
+const MOCK_RELAY_QUERY_PATH = "/query";
 const MAX_REQUEST_BYTES = 64 * 1024;
 const REQUEST_TIMEOUT_MS = 45_000;
 
@@ -22,6 +23,30 @@ type ProviderErrorBody = {
   message?: string;
 };
 
+type AgentEnvironment = Record<string, string | undefined>;
+
+function nonEmptyString(value: unknown) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function supportedProvider(value: unknown) {
+  const provider = nonEmptyString(value)?.toLowerCase();
+  return provider === "anthropic" || provider === "openai" ? provider : null;
+}
+
+function firstEnvironmentValue(
+  environment: AgentEnvironment,
+  keys: readonly string[],
+) {
+  for (const key of keys) {
+    const value = nonEmptyString(environment[key]);
+    if (value) {
+      return value;
+    }
+  }
+  return null;
+}
+
 function isAgentMessage(value: unknown): value is AnnouncementDemoAgentMessage {
   if (typeof value !== "object" || value === null) {
     return false;
@@ -35,19 +60,57 @@ function isAgentMessage(value: unknown): value is AnnouncementDemoAgentMessage {
   );
 }
 
-function parseAgentRequest(value: unknown): AnnouncementDemoAgentRequest {
+export function resolveAnnouncementDemoAgentRequest(
+  value: unknown,
+  environment: AgentEnvironment = process.env,
+): AnnouncementDemoAgentRequest {
   if (typeof value !== "object" || value === null) {
     throw new Error("The agent request was not valid JSON.");
   }
 
   const candidate = value as Record<string, unknown>;
-  if (candidate.provider !== "anthropic" && candidate.provider !== "openai") {
+  const submittedKey = nonEmptyString(candidate.apiKey);
+  const openAiEnvironmentKey = firstEnvironmentValue(environment, [
+    "OPENAI_COMPAT_API_KEY",
+    "OPENAI_API_KEY",
+  ]);
+  const anthropicEnvironmentKey = firstEnvironmentValue(environment, [
+    "ANTHROPIC_API_KEY",
+  ]);
+  const provider =
+    supportedProvider(candidate.provider) ??
+    supportedProvider(
+      firstEnvironmentValue(environment, [
+        "BUZZ_AGENT_PROVIDER",
+        "GOOSE_PROVIDER",
+      ]),
+    ) ??
+    (openAiEnvironmentKey
+      ? "openai"
+      : anthropicEnvironmentKey
+        ? "anthropic"
+        : null);
+  if (!provider) {
     throw new Error("Choose Anthropic or OpenAI as the agent provider.");
   }
-  if (typeof candidate.apiKey !== "string" || !candidate.apiKey.trim()) {
+
+  const apiKey =
+    submittedKey ??
+    (provider === "openai" ? openAiEnvironmentKey : anthropicEnvironmentKey);
+  if (!apiKey) {
     throw new Error("Add an API key in the agent settings first.");
   }
-  if (typeof candidate.model !== "string" || !candidate.model.trim()) {
+
+  const model =
+    nonEmptyString(candidate.model) ??
+    firstEnvironmentValue(environment, [
+      "BUZZ_AGENT_MODEL",
+      "GOOSE_MODEL",
+      ...(provider === "openai"
+        ? ["OPENAI_COMPAT_MODEL", "OPENAI_MODEL"]
+        : ["ANTHROPIC_MODEL"]),
+    ]);
+  if (!model) {
     throw new Error("Choose a model in the agent settings first.");
   }
   if (
@@ -59,9 +122,9 @@ function parseAgentRequest(value: unknown): AnnouncementDemoAgentRequest {
   }
 
   return {
-    provider: candidate.provider,
-    apiKey: candidate.apiKey.trim(),
-    model: candidate.model.trim(),
+    provider,
+    apiKey,
+    model,
     systemPrompt: candidate.systemPrompt,
     messages: candidate.messages,
   };
@@ -227,8 +290,16 @@ function friendlyError(error: unknown) {
  * or written to source, and no Docker-backed relay is required.
  */
 export function announcementDemoAgentPlugin(): Plugin {
+  let agentEnvironment: AgentEnvironment = process.env;
+
   return {
     name: "buzz-announcement-demo-agent",
+    configResolved(config) {
+      agentEnvironment = {
+        ...loadEnv(config.mode, config.envDir, ""),
+        ...process.env,
+      };
+    },
     configureServer(server) {
       server.middlewares.use(AGENT_RESPONSE_PATH, async (request, response) => {
         response.setHeader("Content-Type", "application/json");
@@ -241,7 +312,10 @@ export function announcementDemoAgentPlugin(): Plugin {
         }
 
         try {
-          const input = parseAgentRequest(await readRequestBody(request));
+          const input = resolveAnnouncementDemoAgentRequest(
+            await readRequestBody(request),
+            agentEnvironment,
+          );
           const text =
             input.provider === "openai"
               ? await requestOpenAiResponse(input)
@@ -249,10 +323,37 @@ export function announcementDemoAgentPlugin(): Plugin {
           response.statusCode = 200;
           response.end(JSON.stringify({ text }));
         } catch (error) {
+          const message = friendlyError(error);
+          server.config.logger.error(`[announcement-demo-agent] ${message}`);
           response.statusCode = 502;
-          response.end(JSON.stringify({ error: friendlyError(error) }));
+          response.end(JSON.stringify({ error: message }));
         }
       });
+      server.middlewares.use(
+        MOCK_RELAY_QUERY_PATH,
+        async (request, response) => {
+          response.setHeader("Content-Type", "application/json");
+          response.setHeader("Cache-Control", "no-store");
+
+          if (request.method !== "POST") {
+            response.statusCode = 405;
+            response.end(JSON.stringify({ error: "Method not allowed." }));
+            return;
+          }
+
+          try {
+            await readRequestBody(request);
+            // Announcement state is served by the in-browser bridge. This
+            // endpoint is only a safety net for a native or direct-fetch code
+            // path that bypasses the bridge; it must never reach a real relay.
+            response.statusCode = 200;
+            response.end(JSON.stringify([]));
+          } catch (error) {
+            response.statusCode = 400;
+            response.end(JSON.stringify({ error: friendlyError(error) }));
+          }
+        },
+      );
     },
   };
 }
