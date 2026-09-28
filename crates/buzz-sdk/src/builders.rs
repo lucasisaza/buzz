@@ -1390,6 +1390,42 @@ pub fn build_git_issue_unassignment_with_prior(
     )
 }
 
+/// Build an issue comment (kind:1) in the same shape the Desktop app writes
+/// for Task comments. The relay does not accept NIP-22 kind:1111, so issue
+/// comments are kind:1 text notes scoped by the repo `a` tag.
+///
+/// Tag layout: `["e", <issue>, "", "root"]`, `["a", <repo>]`, then one
+/// `["p", ..]` for the repo owner followed by each distinct recipient. Signing
+/// drops a `p` tag naming the signer (nostr's default self-tag filtering).
+pub fn build_git_issue_comment(
+    repo: &GitRepoCoord,
+    issue_id: &str,
+    content: &str,
+    recipients: &[String],
+) -> Result<EventBuilder, SdkError> {
+    check_content(content, 64 * 1024)?;
+    if content.trim().is_empty() {
+        return Err(SdkError::InvalidInput("comment must not be empty".into()));
+    }
+    let issue = check_hex_exact(issue_id, 64, "issue")?;
+    let a_value = repo.to_a_tag_value()?;
+
+    let mut pubkeys = vec![check_pubkey_hex(&repo.owner, "repo owner")?];
+    for recipient in recipients {
+        let pubkey = check_pubkey_hex(recipient, "recipient")?;
+        if !pubkeys.contains(&pubkey) {
+            pubkeys.push(pubkey);
+        }
+    }
+
+    let mut tags = vec![tag(&["e", &issue, "", "root"])?, tag(&["a", &a_value])?];
+    for pubkey in &pubkeys {
+        tags.push(tag(&["p", pubkey])?);
+    }
+
+    Ok(EventBuilder::new(Kind::Custom(1), content).tags(tags))
+}
+
 #[derive(Clone, Copy)]
 enum GitIssueAssigneeOperation {
     Assign,
@@ -4231,6 +4267,45 @@ mod tests {
         assert!(has_tag(&ev, "p", &assignee));
         assert!(has_tag(&ev, "t", "unassignment"));
         assert!(!has_tag(&ev, "t", "assignment"));
+    }
+
+    #[test]
+    fn git_issue_comment_matches_desktop_shape() {
+        let owner = "a".repeat(64);
+        let repo = GitRepoCoord {
+            owner: owner.clone(),
+            id: "repo".to_string(),
+        };
+        let issue = "b".repeat(64);
+        // The repo owner and case-insensitive duplicates collapse.
+        let recipients = vec!["C".repeat(64), "c".repeat(64), "A".repeat(64)];
+        let ev =
+            sign(build_git_issue_comment(&repo, &issue, "Still failing", &recipients).unwrap());
+        assert_eq!(ev.kind.as_u16(), 1);
+        assert_eq!(ev.content, "Still failing");
+        let tags = ev
+            .tags
+            .iter()
+            .map(|tag| tag.as_slice().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tags,
+            vec![
+                vec![
+                    "e".to_string(),
+                    issue.clone(),
+                    String::new(),
+                    "root".to_string()
+                ],
+                vec!["a".to_string(), format!("30617:{owner}:repo")],
+                vec!["p".to_string(), owner.clone()],
+                vec!["p".to_string(), "c".repeat(64)],
+            ]
+        );
+
+        assert!(build_git_issue_comment(&repo, &issue, " \n", &[]).is_err());
+        assert!(build_git_issue_comment(&repo, "short", "x", &[]).is_err());
+        assert!(build_git_issue_comment(&repo, &issue, "x", &["nope".to_string()]).is_err());
     }
 
     #[test]

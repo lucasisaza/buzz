@@ -215,9 +215,14 @@ fn reduce_assignment_operations(
     state
 }
 
-struct IssueAssignmentContext {
+/// Relay-derived state for writing a kind:1 note on an issue.
+struct IssueWriteContext {
+    /// Unique per-signer timestamp that keeps same-second notes ordered.
     created_at: u64,
+    /// The signer's latest assignment-operation head, when requested.
     prior: Option<String>,
+    /// Issue author followed by the issue root's valid `p` recipients.
+    recipients: Vec<String>,
 }
 
 impl IssueAssignmentOperation {
@@ -370,7 +375,7 @@ async fn publish_issue_assignment_operation(
     let is_self_service = assignees.len() == 1
         && assignees[0].eq_ignore_ascii_case(&signer)
         && !signer.eq_ignore_ascii_case(repo_owner);
-    let context = issue_assignment_context(client, issue, &repo, &signer, is_self_service).await?;
+    let context = issue_write_context(client, issue, &repo, &signer, is_self_service).await?;
     let builder = match (operation, is_self_service) {
         (IssueAssignmentOperation::Assign, true) => {
             buzz_sdk::build_git_issue_assignment_with_prior(
@@ -404,13 +409,13 @@ async fn publish_issue_assignment_operation(
     Ok(())
 }
 
-async fn issue_assignment_context(
+async fn issue_write_context(
     client: &BuzzClient,
     issue: &str,
     repo: &GitRepoCoord,
     signer: &str,
     include_prior: bool,
-) -> Result<IssueAssignmentContext, CliError> {
+) -> Result<IssueWriteContext, CliError> {
     let root_filter = serde_json::json!({
         "kinds": [1621],
         "ids": [issue],
@@ -434,7 +439,7 @@ async fn issue_assignment_context(
     // CLI read responses intentionally omit signatures, so deserialize only
     // the event fields needed for assignment reduction.
     let events = serde_json::from_str::<Vec<AssignmentQueryEvent>>(&response)
-        .map_err(|error| CliError::Other(format!("parse issue assignment context: {error}")))?;
+        .map_err(|error| CliError::Other(format!("parse issue write context: {error}")))?;
     let root = events
         .iter()
         .find(|event| event.kind == 1621 && event.id == issue)
@@ -474,7 +479,60 @@ async fn issue_assignment_context(
                 .cloned()
         })
         .flatten();
-    Ok(IssueAssignmentContext { created_at, prior })
+    Ok(IssueWriteContext {
+        created_at,
+        prior,
+        recipients: issue_recipients(root),
+    })
+}
+
+/// The issue author followed by the root's valid `p` recipients — the same
+/// people Desktop notifies on a Task comment (besides the repo owner).
+fn issue_recipients(root: &AssignmentQueryEvent) -> Vec<String> {
+    std::iter::once(root.pubkey.as_str())
+        .chain(
+            root.tags
+                .iter()
+                .filter(|tag| tag.first().map(String::as_str) == Some("p"))
+                .filter_map(|tag| tag.get(1).map(String::as_str)),
+        )
+        .filter(|pubkey| is_hex64(pubkey))
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// Publish a comment on an issue: a kind:1 note in the same shape Buzz
+/// Desktop writes, notifying the repo owner, issue author, and issue
+/// recipients.
+pub async fn cmd_comment_issue(
+    client: &BuzzClient,
+    issue: &str,
+    repo_owner: &str,
+    repo_id: &str,
+    content: &str,
+) -> Result<(), CliError> {
+    validate_hex64(issue)?;
+    validate_hex64(repo_owner)?;
+    validate_repo_id(repo_id)?;
+    let body = read_or_stdin(content)?;
+    let body = body.trim();
+    if body.is_empty() {
+        return Err(CliError::Usage("--content must not be empty".into()));
+    }
+
+    let repo = GitRepoCoord {
+        owner: repo_owner.to_string(),
+        id: repo_id.to_string(),
+    };
+    let signer = client.keys().public_key().to_hex();
+    let context = issue_write_context(client, issue, &repo, &signer, false).await?;
+    let builder = buzz_sdk::build_git_issue_comment(&repo, issue, body, &context.recipients)
+        .map_err(sdk_err)?
+        .custom_created_at(Timestamp::from_secs(context.created_at));
+    let event = client.sign_event(builder)?;
+    let resp = client.submit_event(event).await?;
+    println!("{resp}");
+    Ok(())
 }
 
 pub async fn cmd_get_issue(client: &BuzzClient, event: &str) -> Result<(), CliError> {
@@ -611,6 +669,12 @@ pub async fn dispatch(cmd: crate::IssuesCmd, client: &BuzzClient) -> Result<(), 
             cmd_create_issue(client, &repo_owner, &repo_id, &title, &content, &label, &to).await
         }
         IssuesCmd::Get { event } => cmd_get_issue(client, &event).await,
+        IssuesCmd::Comment {
+            issue,
+            repo_owner,
+            repo_id,
+            content,
+        } => cmd_comment_issue(client, &issue, &repo_owner, &repo_id, &content).await,
         IssuesCmd::List {
             repo_owner,
             repo_id,
@@ -689,8 +753,8 @@ pub async fn dispatch(cmd: crate::IssuesCmd, client: &BuzzClient) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::{
-        assignment_note_label, reduce_assignment_operations, AssignmentEvent, AssignmentQueryEvent,
-        ISSUE_ASSIGNMENT_LABEL, ISSUE_UNASSIGNMENT_LABEL,
+        assignment_note_label, issue_recipients, reduce_assignment_operations, AssignmentEvent,
+        AssignmentQueryEvent, ISSUE_ASSIGNMENT_LABEL, ISSUE_UNASSIGNMENT_LABEL,
     };
 
     const ISSUE: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
@@ -762,6 +826,27 @@ mod tests {
 
         assert_eq!(event.kind, 1);
         assert_eq!(event.pubkey, VOLUNTEER);
+    }
+
+    #[test]
+    fn issue_recipients_are_author_then_valid_root_recipients() {
+        let root = serde_json::from_value::<AssignmentQueryEvent>(serde_json::json!({
+            "id": ISSUE,
+            "kind": 1621,
+            "pubkey": AUTHOR.to_ascii_uppercase(),
+            "created_at": 100,
+            "tags": [
+                ["a", format!("30617:{OWNER}:repo")],
+                ["p", OWNER],
+                ["p", "not-a-pubkey"],
+                ["p"],
+                ["e", VOLUNTEER],
+                ["p", VOLUNTEER.to_ascii_uppercase()]
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(issue_recipients(&root), vec![AUTHOR, OWNER, VOLUNTEER]);
     }
 
     #[test]
